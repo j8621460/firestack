@@ -49,19 +49,11 @@ const ( // see dnsx/transport.go
 	// dns resolver for dns resolvers and for firestack (built-in)
 	// delegates queries to Bootstrap.
 	IpMapper = "IpMapper"
-
-	// dns request origin indicators
-
-	// DNS request originated internally
-	OriginInternal = "self"
-
-	// DNS request originated from tunnel read
-	OriginTunnel = "tunnel"
 )
 
 const ( // from dnsx/queryerror.go
 	// Start: Transaction started
-	Start int32 = iota
+	Start = iota
 	// Complete : Transaction completed successfully
 	Complete
 	// SendFailed : Failed to send query
@@ -80,12 +72,8 @@ const ( // from dnsx/queryerror.go
 	ClientError
 	// Paused: Transport is paused
 	Paused
-	// Unpaused: Transport may have been unpaused
-	Unpaused
 	// DEnd: Transport stopped
 	DEnd
-	// Unknown: Transport status is unknown
-	Unknown int32 = 100
 )
 
 const ( // from: dnsx/rethinkdns.go
@@ -93,48 +81,21 @@ const ( // from: dnsx/rethinkdns.go
 	EB64
 )
 
-type DNSMeasurement struct {
-	// ID is the unique identifier for this measurement.
-	MID string
-	// Max round-trip time for this transport, in millis.
-	Max int64
-	// Min round-trip time for this transport, in millis.
-	Min int64
-	// Median round-trip time for this transport, in millis.
-	P50 int64
-	// 95th percentile round-trip time for this transport, in millis.
-	P95 int64
-	// Jitter is the standard deviation of round-trip times for this transport,in millis.
-	Jitter int64
-	// Percentage of queries answered during this measurement.
-	Success int32
-	// Seconds is the total duration to complete this measurement, in seconds.
-	Seconds int32
-	// Domains is a csv of domains queried for this measurement.
-	Domains string
-	// Errors is a csv of error messages encountered during this measurement.
-	Errors string
-	// Addrs is IPs as csv of the DNS endpoint being measured.
-	Addrs string
-}
-
 // DNSTransport exports necessary methods from dnsx.Transport
 type DNSTransport interface {
 	// uniquely identifies this transport
-	ID() string
+	ID() *Gostr
 	// one of DNS53, DOH, DNSCrypt, System
-	Type() string
+	Type() *Gostr
 	// Median round-trip time for this transport, in millis.
 	P50() int64
 	// Return the server host address used to initialize this transport.
-	GetAddr() string
+	GetAddr() *Gostr
 	// Return the proxy (relay) always used by this transport.
 	// Returns nil if there isn't any.
 	GetRelay() Proxy
-	// Measure runs a DNSMeasurement for n number of concurrent queries for upto seconds duration, on this transport.
-	Measure(mid string, n, seconds int32) *DNSMeasurement
-
-	DNSStatusProvider
+	// State of the transport after previous query (see: queryerror.go)
+	Status() int
 }
 
 type DNSTransportMult interface {
@@ -142,31 +103,29 @@ type DNSTransportMult interface {
 	// Add adds a transport to this multi-transport.
 	Add(t DNSTransport) bool
 	// Remove removes a transport from this multi-transport.
-	Remove(id string) bool
+	Remove(id *Gostr) bool
 	// Refresh re-registers transports and returns a csv of active ones.
-	Refresh() (string, error)
+	Refresh() (*Gostr, error)
 	// LiveTransports returns a csv of active transports.
-	LiveTransports() string
+	LiveTransports() *Gostr
 }
 
 type DNSTransportProvider interface {
 	// Get returns a transport from this multi-transport.
-	Get(id string) (DNSTransport, error)
-	// GetIPs returns a csv of IPs for the transport identified by id.
-	GetIPs(id string) string
+	Get(id *Gostr) (DNSTransport, error)
 }
 
 type RDNS interface {
 	// SetStamp sets the rethinkdns blockstamp.
-	SetStamp(string) error
+	SetStamp(*Gostr) error
 	// GetStamp returns the current rethinkdns blockstamp.
-	GetStamp() (string, error)
+	GetStamp() (*Gostr, error)
 	// StampToNames returns csv group:names of blocklists in the given stamp s.
-	StampToNames(s string) (string, error)
+	StampToNames(s *Gostr) (*Gostr, error)
 	// FlagsToStamp returns a blockstamp for given csv blocklist-ids, if valid.
-	FlagsToStamp(csv string, enctyp int) (string, error)
+	FlagsToStamp(csv *Gostr, enctyp int) (*Gostr, error)
 	// StampToFlags retruns csv blocklist-ids given a valid blockstamp s.
-	StampToFlags(s string) (string, error)
+	StampToFlags(s *Gostr) (*Gostr, error)
 }
 
 type RDNSResolver interface {
@@ -178,34 +137,27 @@ type RDNSResolver interface {
 	SetRdnsRemote(filetag string) error
 	// GetRdnsRemote returns the remote rdns resolver.
 	GetRdnsRemote() (RDNS, error)
-	// Translate enables or disables ALG and fixed responses.
-	Translate(alg, fix bool)
+	// Translate enables or disables ALG/fixed responses
+	Translate(bool)
 }
 
 type DNSTransportMultProvider interface {
 	// GetMult returns a multi-transport by id.
-	GetMult(id string) (DNSTransportMult, error)
-}
-
-type DNSStatusProvider interface {
-	// State of the transport after previous query (see: queryerror.go)
-	Status() int32
+	GetMult(id *Gostr) (DNSTransportMult, error)
 }
 
 type DNSResolver interface {
-	DNSTransportProvider
 	DNSTransportMult
 	DNSTransportMultProvider
 	RDNSResolver
-	DNSStatusProvider
 }
 
 type ResolverListener interface {
 	// OnDNSAdded is called when a new DNS transport with id is added.
-	OnDNSAdded(id string)
+	OnDNSAdded(id *Gostr)
 	// OnDNSRemoved is called when a DNS transport with id is removed, except
 	// when the transport is stopped, then OnDNSStopped is called instead.
-	OnDNSRemoved(id string)
+	OnDNSRemoved(id *Gostr)
 	// OnDNSStopped is called when all DNS transports are stopped. Note:
 	// OnDNSRemoved is not called for each transport even if they are
 	// being removed and not just stopped.

@@ -70,7 +70,7 @@ type gtunnel struct {
 	done   context.CancelFunc
 	stack  *stack.Stack              // a tcpip stack
 	ep     netstack.SeamlessEndpoint // endpoint for the stack
-	sid    atomic.Int64              // session id (almost always tunnel fd)
+	sid    *core.Volatile[int]       // session id (almost always tunnel fd)
 	hdl    netstack.GConnHandler     // tcp, udp, and icmp handlers
 	pcapio *pcapsink                 // pcap output, if any
 	closed atomic.Bool               // open/close?
@@ -92,7 +92,9 @@ func (t *gtunnel) Mtu() int32 {
 	return -1
 }
 
-func (t *gtunnel) waitForEndpoint() {
+func (t *gtunnel) waitForEndpoint(ctx context.Context) {
+	defer core.Recover(core.Exit11, "g.wait")
+
 	const maxchecks = 5
 	const betweenChecks = 3 * time.Second
 	const uptimeThreshold = 3 * time.Second
@@ -101,7 +103,6 @@ func (t *gtunnel) waitForEndpoint() {
 	i := 0
 
 	defer func() {
-		t.done() // cancel current context, if not already done
 		log.I("tun: waiter: done; #%d, %s", i, core.FmtTimeAsPeriod(waitStart))
 	}()
 
@@ -112,7 +113,7 @@ func (t *gtunnel) waitForEndpoint() {
 		runid := "g." + strconv.Itoa(i)
 
 		select {
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			t.Disconnect() // may already be disconnected
 			log.D("tun: waiter: ctx done; #%d", i)
 			return
@@ -151,7 +152,7 @@ func (t *gtunnel) Disconnect() {
 		t.closed.Store(true)
 		// go t.Unlink() // may block? takes more time?
 		t.stack.Destroy()
-		log.I("tun: %d netstack closed", t.sid.Load())
+		log.I("tun: netstack closed")
 	})
 }
 
@@ -190,7 +191,6 @@ func NewGTunnel(pctx context.Context, fd, mtu int, l3 string, hdl netstack.GConn
 		l3 = settings.IP46 // always dual-stack
 		log.W("tun: new netstack(%d) l3 is %s needed %s", fd, l3, settings.IP46)
 	}
-	// set route before calling Up
 	netstack.Route(stack, l3)
 	// Enabled() may temporarily return false when Up() is in progress.
 	if nic, err = netstack.Up(stack, ep, hdl); err != nil { // attach new endpoint
@@ -207,14 +207,14 @@ func NewGTunnel(pctx context.Context, fd, mtu int, l3 string, hdl netstack.GConn
 		done:   done,
 		stack:  stack,
 		ep:     ep,
+		sid:    core.NewVolatile(fd), // fd is the og tun device
 		hdl:    hdl,
 		pcapio: sink,
 		closed: atomic.Bool{},
 		once:   sync.Once{},
 	}
-	t.sid.Store(int64(fd))          // fd is the og tun device
-	t.setRoute(settings.Engine(l3)) // sets happy eyeballs
-	core.Go("tun.awaiter", t.waitForEndpoint)
+
+	core.Go1("tun.awaiter", t.waitForEndpoint, ctx)
 
 	return
 }
@@ -263,7 +263,7 @@ func (t *gtunnel) setLink(fd, mtu int) (err error) {
 		if err != nil {
 			t.sid.Store(-1) // reset sid
 		} else {
-			t.sid.Store(int64(fd)) // set sid to fd
+			t.sid.Store(fd) // set sid to fd
 		}
 	}()
 
@@ -282,8 +282,10 @@ func (t *gtunnel) setLink(fd, mtu int) (err error) {
 func (t *gtunnel) setRoute(engine int) error {
 	// netstack route is never changed; always dual-stack
 	netstack.Route(t.stack, settings.IP46)
-	log.I("tun: new route; (no-op) got %s but set %s; doing happy eyeballs? %t",
-		settings.L3(engine), settings.IP46, settings.HappyEyeballs.Load())
+	doHappyEyeballs := engine == settings.Ns46
+	ok := settings.HappyEyeballs.CompareAndSwap(!doHappyEyeballs, doHappyEyeballs)
+	log.I("tun: new route; (no-op) got %s but set %s; enable happy eyeballs? %t / ok? %t",
+		settings.L3(engine), settings.IP46, doHappyEyeballs, ok)
 	return nil
 }
 

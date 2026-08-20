@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -39,12 +38,12 @@ type httpx struct {
 	sync.Mutex          // protects tx.ProxyHttpServer
 	*tx.ProxyHttpServer // changed by Hop()
 
-	status atomic.Int32 // status of the server
+	status *core.Volatile[int] // status of the server
 }
 
 type httpxhandle struct {
-	AuthHandle
-	px core.MutexValue[ipn.Proxy]
+	*AuthHandle
+	px *core.Volatile[ipn.Proxy]
 }
 
 func newHttpServer(id, x string, ctl protect.Controller, listener ServerListener) (*httpx, error) {
@@ -63,8 +62,9 @@ func newHttpServer(id, x string, ctl protect.Controller, listener ServerListener
 		pwd, _ = u.User.Password() // may be empty
 	}
 	dialer := protect.MakeNsDialer(id, ctl)
-	hdl := httpxhandle{
-		AuthHandle: AuthHandle{usr: usr, pwd: pwd},
+	hdl := &httpxhandle{
+		AuthHandle: &AuthHandle{usr: usr, pwd: pwd},
+		px:         core.NewZeroVolatile[ipn.Proxy](),
 	}
 	hproxy := tx.NewProxyHttpServer()
 	hproxy.Logger = log.Glogger
@@ -94,11 +94,11 @@ func newHttpServer(id, x string, ctl protect.Controller, listener ServerListener
 		usetls:          usetls,
 		host:            host,
 		dialer:          dialer,
-		hdl:             &hdl,
+		hdl:             hdl,
 		svc:             svc,
 		listener:        listener,
+		status:          core.NewVolatile(SOK),
 	}
-	hx.status.Store(SOK)
 	hproxy.OnRequest().HandleConnectFunc(hx.routeConnect)
 	hproxy.OnRequest().DoFunc(hx.route)
 	hproxy.OnResponse().DoFunc(hx.summarize)
@@ -336,7 +336,7 @@ func (h *httpx) Refresh() error {
 
 func (h *httpx) pid() (x string) {
 	if px := h.hdl.px.Load(); px != nil && core.IsNotNil(px) {
-		x = px.ID()
+		x = px.ID().V()
 	}
 	return
 }
@@ -347,12 +347,12 @@ func (h *httpx) ID() string {
 
 func (h *httpx) GetAddr() string {
 	if px := h.hdl.px.Load(); px != nil && core.IsNotNil(px) {
-		return px.GetAddr()
+		return px.GetAddr().V()
 	}
 	return h.host
 }
 
-func (h *httpx) Status() int32 {
+func (h *httpx) Status() int {
 	return h.status.Load()
 }
 

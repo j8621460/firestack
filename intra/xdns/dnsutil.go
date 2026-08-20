@@ -15,12 +15,10 @@
 package xdns
 
 import (
-	"bytes"
 	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
-	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -33,8 +31,6 @@ const paddingBlockSize = 128 // RFC8467 recommendation
 
 // OPTION-CODE + OPTION-LENGTH
 const optPaddingHeaderLen int = 2 + 2
-
-var zeroprefix = net.IPNet{}
 
 func AsMsg(packet []byte) *dns.Msg {
 	msg, err := AsMsg2(packet)
@@ -92,15 +88,6 @@ func Request4FromRequest6(msg6 *dns.Msg) *dns.Msg {
 	msg4 := msg6.Copy()
 	msg4.SetQuestion(QName(msg6), dns.TypeA)
 	return msg4
-}
-
-func Request6FromRequest4(msg4 *dns.Msg) *dns.Msg {
-	if !HasAnyQuestion(msg4) {
-		return nil
-	}
-	msg6 := msg4.Copy()
-	msg6.SetQuestion(QName(msg4), dns.TypeAAAA)
-	return msg6
 }
 
 func EmptyResponseFromMessage(srcMsg *dns.Msg) *dns.Msg {
@@ -191,19 +178,22 @@ func WithTtl(msg *dns.Msg, secs uint32, typ ...uint16) (ok bool) {
 	if !HasAnyAnswer(msg) {
 		return ok
 	}
-	msg.AuthenticatedData = false // reset AD flag if any
-	msg.CheckingDisabled = false  // reset CD flag if any
 	for _, a := range msg.Answer {
 		if a == nil {
 			continue
 		}
-		h := a.Header()
-		if h.Ttl <= 0 || h.Ttl == secs {
+		if a.Header().Ttl <= 0 || a.Header().Ttl == secs {
 			continue
 		}
-		resetTtl := len(typ) <= 0 || slices.Contains(typ, h.Rrtype)
+		resetTtl := len(typ) <= 0
+		for _, t := range typ {
+			if a.Header().Rrtype == t {
+				resetTtl = true
+				break
+			}
+		}
 		if resetTtl {
-			h.Ttl = secs
+			a.Header().Ttl = secs
 			ok = true
 		}
 	}
@@ -217,7 +207,12 @@ func RTtl(msg *dns.Msg) int {
 	}
 
 	for _, a := range msg.Answer {
-		maxttl = max(maxttl, a.Header().Ttl)
+		if a.Header().Ttl > 0 {
+			ttl := a.Header().Ttl
+			if maxttl < ttl {
+				maxttl = ttl
+			}
+		}
 	}
 	return int(maxttl)
 }
@@ -609,13 +604,6 @@ func Question(domain string, qtyp uint16) ([]byte, error) {
 	msg := &dns.Msg{}
 	msg.SetQuestion(dns.Fqdn(domain), qtyp)
 	return msg.Pack()
-}
-
-// QuestionMsg returns a dns.Msg with the given question.
-func QuestionMsg(domain string, qtyp uint16) (*dns.Msg, error) {
-	msg := &dns.Msg{}
-	msg.SetQuestion(dns.Fqdn(domain), qtyp)
-	return msg, nil
 }
 
 func BlockResponseFromMessage(q []byte) (*dns.Msg, error) {
@@ -1230,20 +1218,12 @@ func MakeAAAARecord(name string, ip6 string, ttl uint32) *dns.AAAA {
 	return rec
 }
 
-func IsZeroPrefix(pfx net.IPNet) bool {
-	return zeroprefix.IP.Equal(pfx.IP) && bytes.Equal(pfx.Mask, zeroprefix.Mask)
-}
-
 // MaybeToQuadA translates an A record to a AAAA record if the prefix is not nil.
 // The ttl of the new record is the max of the original ttl and minttl.
 // If the prefix is nil or answer has an empty A record, it returns nil.
-func MaybeToQuadA(answer dns.RR, prefix net.IPNet) *dns.AAAA {
-	if IsZeroPrefix(prefix) {
-		log.W("dnsutil: maybeToQuadA: prefix missing?")
-		return nil
-	}
+func MaybeToQuadA(answer dns.RR, prefix *net.IPNet) *dns.AAAA {
 	header := answer.Header()
-	if header.Rrtype != dns.TypeA {
+	if prefix == nil || header.Rrtype != dns.TypeA {
 		return nil
 	}
 	ipxx, aok := answer.(*dns.A)
@@ -1256,13 +1236,7 @@ func MaybeToQuadA(answer dns.RR, prefix net.IPNet) *dns.AAAA {
 	}
 	ttl := max(ansTTL, header.Ttl)
 
-	// if prefix is empty IP, ipv6 will be all zeros?
-	ipv6 := ip4to6(prefix, ipv4)
-
-	if ipv6 == nil || len(ipv6) != net.IPv6len || ipv6.Equal(net.IPv6zero) {
-		log.W("dnsutil: maybeToQuadA: invalid ipv6 %s from %s/%s", ipv6, ipv4, prefix.String())
-		return nil
-	}
+	ipv6 := ip4to6(*prefix, ipv4)
 
 	trec := new(dns.AAAA)
 	trec.Hdr = dns.RR_Header{

@@ -4,34 +4,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// Package runtime exposes a curated set of Go runtime internals
-// (secure mode, traceback level, environment variables) that the
-// intra core / tun2socks code needs to control on Android.
-//
-// It is split out of intra/core into its own sub-package so that the
-// //go:linkname directives below (which require the final link to be
-// invoked with -checklinkname=0) only affect the final link of the
-// tun2socks binary, not every other binary or test that imports
-// intra/core transitively. Without this split, any package that
-// transitively imports intra/core (which is most of the intra tree)
-// would have to be built with -checklinkname=0 too.
-//
-// Pushing / pulling runtime symbols via //go:linkname works provided
-// the final link uses -ldflags="-checklinkname=0".
-package runtime
+package core
 
 import (
 	"os"
 	_ "unsafe" // for go:linkname
-
-	"github.com/celzero/firestack/intra/log"
 )
+
+// pushing / pulling symbols work provided
+// -ldflags="checklinkname=0"
 
 //go:linkname secureMode runtime.secureMode
 var secureMode bool
-
-//go:linkname traceback_env runtime.traceback_env
-var traceback_env uint32
 
 func init() {
 	// github.com/golang/go/issues/69868
@@ -81,7 +65,7 @@ func RuntimeEnviron() []string {
 
 // SetRuntimeEnviron sets / adds a key-value pair in the Go runtime's
 // cached environment vars.
-func SetRuntimeEnviron(key, val string) (didSet, overwrote bool, err error) {
+func SetRuntimeEnviron(key, val string) (didSet bool, err error) {
 	envs := runtime_environ()
 	kv := key + "="
 	for i, e := range envs {
@@ -91,14 +75,6 @@ func SetRuntimeEnviron(key, val string) (didSet, overwrote bool, err error) {
 			didSet = true
 			break
 		}
-	}
-	// override both key and val from last index
-	if !didSet && len(envs) > 0 {
-		last := len(envs) - 1
-		log.W("runtime: SetRuntimeEnviron: key %s not found; overriding %s; val %s", key, envs[last], val)
-		envs[last] = kv + val
-		err = os.Setenv(key, val)
-		overwrote = true
 	}
 	return
 }
@@ -120,24 +96,6 @@ func GetRuntimeEnviron(key string) (val string, found bool) {
 // github.com/golang/go/blob/e2fef50def98/src/runtime/write_err_android.go#L39
 func RuntimeWtf(s string) {
 	runtime_wtf([]byte(s))
-}
-
-// traceback_env is the floor value that setTraceback ORs into every call:
-// traceback_env = traceback_cache after finishDebugVarsSetup, so it
-// encodes whatever level+crash bits were in force at that point.
-// This makes traceback a one-way ratchet: once the level goes up (e.g.
-// to "system"), t |= traceback_env prevents it from ever coming back
-// down via a subsequent debug.SetTraceback("single") call.
-// Zeroing it before setTraceback / finishDebugVarsSetup breaks the
-// ratchet so the level can be raised or lowered freely.
-// Must be called before RuntimeFinishDebugVarsSetup / debug.SetTraceback
-// when a lower level than the previously-set one is desired.
-// sample test: go.dev/play/p/VOPFogTh8Ny
-// github.com/golang/go/blob/fed3b0a298/src/runtime/runtime1.go#L27
-func RuntimeResetTracebackEnv() (prev uint32) {
-	prev = traceback_env
-	traceback_env = 0
-	return prev
 }
 
 //go:linkname runtime_environ runtime.environ

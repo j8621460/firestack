@@ -29,8 +29,6 @@ import (
 
 const klen = ed25519.SeedSize
 
-var errWGEcKeyLen = errors.New("keys must decode to exactly 32 bytes")
-
 type (
 	eckey [klen]byte
 )
@@ -41,19 +39,19 @@ type WgKey interface {
 	// IsZero returns true if the key is all zeros.
 	IsZero() bool
 	// Base64 returns the key as a base64-encoded string.
-	Base64() string
+	Base64() *Gostr
 	// Hex returns the key as a hex-encoded string.
-	Hex() string
+	Hex() *Gostr
 	// Mult returns the key multiplied by the basepoint (curve25519).
 	Mult() WgKey
 }
 
-func (k *eckey) Hex() string {
-	return hex.EncodeToString(k[:])
+func (k *eckey) Hex() *Gostr {
+	return StrOf(hex.EncodeToString(k[:]))
 }
 
-func (k *eckey) Base64() string {
-	return base64.StdEncoding.EncodeToString(k[:])
+func (k *eckey) Base64() *Gostr {
+	return StrOf(base64.StdEncoding.EncodeToString(k[:]))
 }
 
 func (k *eckey) IsZero() bool {
@@ -95,10 +93,10 @@ func NewWgPrivateKeyFrom(k [klen]byte) WgKey {
 func parseKeyBase64(s string) (*eckey, error) {
 	k, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return nil, fmt.Errorf("invalid key: %w", err)
+		return nil, fmt.Errorf("invalid key: %v", err)
 	}
 	if len(k) != klen {
-		return nil, errWGEcKeyLen
+		return nil, errors.New("keys must decode to exactly 32 bytes")
 	}
 	var key eckey
 	copy(key[:], k)

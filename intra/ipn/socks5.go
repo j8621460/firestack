@@ -12,7 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"sync/atomic"
+	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
@@ -34,15 +34,13 @@ type socks5 struct {
 	id       string                 // unique identifier
 	opts     *settings.ProxyOptions // connect options
 	d        protect.RDialer        // dialer to this upstream proxy
-	hdl      uint64
-	dhdl     uint64
-	mh       *multihost.MH                       // upstream proxy host resolution
-	outbound []proxy.Dialer                      // outbound dialers via this upstream proxy
-	px       ProxyProvider                       // proxy provider
-	via      atomic.Pointer[core.WeakRef[Proxy]] // hop proxy
-	lastdial atomic.Int64                        // last time this transport attempted a connection
-	status   atomic.Int32                        // status of this transport
-	done     context.CancelFunc                  // cancel func
+	outbound []proxy.Dialer         // outbound dialers via this upstream proxy
+	px       ProxyProvider          // proxy provider
+	viaID    *core.Volatile[string] // hop id
+	via      *core.WeakRef[Proxy]   // hop proxy
+	lastdial time.Time              // last time this transport attempted a connection
+	status   *core.Volatile[int]    // status of this transport
+	done     context.CancelFunc     // cancel func
 }
 
 type socks5tcpconn struct {
@@ -107,22 +105,7 @@ func NewSocks5Proxy(id string, ctx context.Context, ctl protect.Controller, px P
 
 	portnumber, _ := strconv.Atoi(po.Port)
 	mh := multihost.New(id)
-	mh.Add([]string{po.Host, po.IP}) // parse-only; does not resolve hostnames
-	mh.Build()                       // resolve names: async if addrs already exist, else sync
-
-	// always with a network namespace aware dialer
-	dialer := protect.MakeNsRDial(id, ctx, ctl)
-	h := &socks5{
-		id:   id,
-		d:    dialer,
-		mh:   mh,
-		px:   px,
-		opts: po,
-		done: done,
-	}
-	h.since.Store(now())
-	h.hdl = core.Loc(h)
-	h.dhdl = core.Loc(h.d)
+	mh.Add([]string{po.Host, po.IP}) // resolves if ip is name
 
 	var clients []proxy.Dialer
 	// x.net.proxy doesn't yet support udp
@@ -137,29 +120,58 @@ func NewSocks5Proxy(id string, ctx context.Context, ctl protect.Controller, px P
 		if cerr != nil {
 			err = errors.Join(err, cerr)
 		} else {
-			c.DialTCP = h.txdial // h.outbound uses this
-			c.DialUDP = h.txdial // h.outbound uses this
 			clients = append(clients, c)
 		}
 	}
 
-	if len(clients) == 0 || err != nil {
+	if len(clients) == 0 && err != nil {
 		defer done()
-		err = log.EE("proxy: err creating socks5 for %v (opts: %v): %v", mh, po, err)
+		log.W("proxy: err creating socks5 for %v (opts: %v): %v",
+			mh, po, err)
 		return nil, err
 	}
 
-	h.outbound = clients
+	// always with a network namespace aware dialer
+	dialer := protect.MakeNsRDial(id, ctx, ctl)
+	h := &socks5{
+		id:       id,
+		d:        dialer,
+		px:       px,
+		outbound: clients,
+		viaID:    core.NewZeroVolatile[string](),
+		opts:     po,
+		done:     done,
+	}
 
-	log.I("proxy: socks5: created %s with clients(%d), opts(%s)", h.id, len(clients), po)
+	tx.DialTCP = h.txdial // h.outbound uses this
+	tx.DialUDP = h.txdial // h.outbound uses this
+
+	via, err := core.NewWeakRef(h.viafor, viaok)
+	if err != nil {
+		defer done()
+		log.W("proxy: socks5: %s err via: %v", h.ID(), err)
+		return nil, err
+	}
+	h.via = via
+
+	log.D("proxy: socks5: created %s with clients(%d), opts(%s)",
+		h.id, len(clients), po)
 
 	return h, nil
 }
 
+func (h *socks5) viafor() *Proxy {
+	return viafor(h.id, h.viaID.Load(), h.px)
+}
+
+func (h *socks5) swapVia(new Proxy) (old Proxy) {
+	return swapVia(h.id, new, h.viaID, h.via)
+}
+
 func (h *socks5) txdial(n, src, dst string) (c net.Conn, err error) {
 	who := idstr(h)
-	if ref := h.via.Load(); ref != nil {
-		if v, vok := ref.Get(); vok {
+	if usevia(h.viaID) {
+		if v, vok := h.via.Get(); vok {
 			who = idstr(v)
 			c, err = v.DialBind(n, src, dst)
 		} else {
@@ -177,13 +189,13 @@ func (h *socks5) txdial(n, src, dst string) (c net.Conn, err error) {
 }
 
 // Handle implements Proxy.
-func (h *socks5) Handle() uint64 {
-	return h.hdl
+func (h *socks5) Handle() uintptr {
+	return core.Loc(h)
 }
 
 // DialerHandle implements Proxy.
-func (h *socks5) DialerHandle() uint64 {
-	return h.dhdl
+func (h *socks5) DialerHandle() uintptr {
+	return core.Loc(h.d)
 }
 
 // Dial implements Proxy.
@@ -200,11 +212,11 @@ func (h *socks5) DialBind(network, local, remote string) (c protect.Conn, err er
 
 // todo: bind to local
 func (h *socks5) dial(network, _, remote string) (c protect.Conn, err error) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
 
-	h.lastdial.Store(now())
+	h.lastdial = time.Now()
 	// todo: tx.Client can only dial in to ip:port and not host:port even for server addr
 	// tx.Client.Dial does not support dialing into client addr as hostnames
 	if c, err = dialers.ProxyDials(h.outbound, network, remote); err == nil {
@@ -232,10 +244,7 @@ func (h *socks5) dial(network, _, remote string) (c protect.Conn, err error) {
 		log.W("proxy: socks5: %s dial(%s) failed %s => %s: %v",
 			h.ID(), network, h.GetAddr(), remote, err)
 	}
-	if a, ok := laddr(c); ok {
-		h.lastaddr.Store(&a)
-	}
-	defer localDialStatus(&h.status, err)
+	defer localDialStatus(h.status, err)
 	return
 }
 
@@ -245,13 +254,13 @@ func (h *socks5) Dialer() protect.RDialer {
 }
 
 // ID implements x.Proxy.
-func (h *socks5) ID() string {
-	return h.id
+func (h *socks5) ID() *x.Gostr {
+	return x.StrOf(h.id)
 }
 
 // Type implements x.Proxy.
-func (h *socks5) Type() string {
-	return SOCKS5
+func (h *socks5) Type() *x.Gostr {
+	return x.StrOf(SOCKS5)
 }
 
 // Router implements x.Proxy.
@@ -260,58 +269,47 @@ func (h *socks5) Router() x.Router {
 }
 
 // Reaches implements x.Router.
-func (h *socks5) Reaches(hostportOrIPPortCsv string) bool {
-	return Reaches(h, hostportOrIPPortCsv)
-}
-
-// Self implements x.Router.
-func (h *socks5) Self(ip string) bool {
-	if len(ip) <= 0 {
-		return false
-	}
-	if h.GW.Self(ip) {
-		return true
-	}
-	if mh := h.mh; mh != nil {
-		return mh.Has(ip)
-	}
-	return false
+func (h *socks5) Reaches(hostportOrIPPortCsv *x.Gostr) bool {
+	return Reaches(h, hostportOrIPPortCsv.V())
 }
 
 // Hop implements Proxy.
-func (h *socks5) Hop(via *core.WeakRef[Proxy], dryrun bool) error {
+func (h *socks5) Hop(p Proxy, dryrun bool) error {
+	if p == nil {
+		if !dryrun {
+			old := h.swapVia(nil)
+			log.I("socks5: hop(%s) removed", idhandle(old))
+		}
+		return nil
+	}
+	if p.Status() == END {
+		return errProxyStopped
+	}
+
 	if !dryrun {
-		old := h.via.Swap(via)
-		log.I("socks5: hop %s => %s", refhandle(old), refhandle(via))
+		old := h.swapVia(p)
+		log.I("socks5: hop %s => %s", idhandle(old), idhandle(p))
 	}
 	return nil
 }
 
 // Via implements x.Router.
 func (h *socks5) Via() (x.Proxy, error) {
-	if ref := h.via.Load(); ref != nil {
-		if v, ok := ref.Get(); ok && v != nil {
-			return v, nil
-		}
+	if v := h.via.Load(); v != nil {
+		return v, nil
 	}
 	return nil, errNoHop
 }
 
 // GetAddr implements x.Proxy.
-func (h *socks5) GetAddr() string {
-	if a := h.lastaddr.Load(); a != nil {
-		return *a
-	}
-	return h.opts.IPPort
+func (h *socks5) GetAddr() *x.Gostr {
+	return x.StrOf(h.opts.IPPort)
 }
 
 // Status implements Proxy.
-func (h *socks5) Status() int32 {
+func (h *socks5) Status() int {
 	s := h.status.Load()
-	if candial2(s) != nil {
-		return s // paused or ended
-	}
-	if idling(h.lastdial.Load()) {
+	if s != END && idling(h.lastdial) {
 		return TZZ
 	}
 	return s
@@ -325,7 +323,7 @@ func (h *socks5) Pause() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TPU)
+	ok := h.status.Cas(st, TPU)
 	log.I("proxy: socks5: paused? %t", ok)
 	return ok
 }
@@ -338,7 +336,7 @@ func (h *socks5) Resume() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TUP)
+	ok := h.status.Cas(st, TUP)
 	go h.Refresh() // no-op since SkipRefresh
 	log.I("proxy: socks5: resumed? %t", ok)
 	return ok
@@ -354,7 +352,7 @@ func (h *socks5) Stop() error {
 
 // OnProtoChange implements Proxy.
 func (h *socks5) OnProtoChange(_ LinkProps) (string, bool) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return "", false
 	}
 	return h.opts.FullUrl(), true

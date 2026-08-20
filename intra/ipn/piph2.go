@@ -20,7 +20,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -47,17 +46,16 @@ type piph2 struct {
 	rsasig   string         // hex, authorizer unblinded signature
 	client   http.Client    // h2 client, see trType
 	outbound *protect.RDial // h2 dialer
-	hdl      uint64
-	dhdl     uint64
 	px       ProxyProvider
-	via      atomic.Pointer[core.WeakRef[Proxy]] // hop dialer
+	via      *core.WeakRef[Proxy]   // hop dialer
+	viaID    *core.Volatile[string] // hop proxy ID
 	opts     *settings.ProxyOptions
 
 	done context.CancelFunc
 
 	// mutable fields
-	lastdial atomic.Int64 // last dial time as unix millis
-	status   atomic.Int32 // proxy status: TOK, TKO, END
+	lastdial *core.Volatile[time.Time] // last dial time
+	status   *core.Volatile[int]       // proxy status: TOK, TKO, END
 }
 
 // github.com/posener/h2conn/blob/13e7df33ed1/conn.go
@@ -153,8 +151,8 @@ func (t *piph2) dialtls(network, addr string, cfg *tls.Config) (net.Conn, error)
 // which is aware of proto changes.
 func (t *piph2) dial(network, addr string) (c net.Conn, err error) {
 	who := idstr(t)
-	if ref := t.via.Load(); ref != nil {
-		if v, vok := ref.Get(); vok { // dial via another proxy
+	if usevia(t.viaID) {
+		if v, vok := t.via.Get(); vok { // dial via another proxy
 			who = idstr(v)
 			c, err = v.Dial(network, addr)
 		} else {
@@ -171,7 +169,7 @@ func (t *piph2) dial(network, addr string) (c net.Conn, err error) {
 			c, err = dialers.SplitDial(t.outbound, network, addr)
 		}
 	}
-	defer localDialStatus(&t.status, err)
+	defer localDialStatus(t.status, err)
 	logei(err)("piph2: dial(%s) %s (via %s); err? %v", network, addr, who, err)
 	return
 }
@@ -220,16 +218,16 @@ func NewPipProxy(ctx context.Context, ctl protect.Controller, px ProxyProvider, 
 		port:     port,
 		outbound: protect.MakeNsRDial(RpnH2, ctx, ctl),
 		px:       px,
+		viaID:    core.NewZeroVolatile[string](),
 		token:    po.Auth.User,
 		toksig:   po.Auth.Password,
 		rsasig:   rsasig,
+		status:   core.NewVolatile(TUP),
 		done:     done,
+		lastdial: core.NewVolatile(time.Time{}),
 		opts:     po,
 	}
-	t.status.Store(TUP)
-	t.since.Store(now())
-	t.hdl = core.Loc(t)
-	t.dhdl = core.Loc(t.outbound)
+	t.via, err = core.NewWeakRef(t.viafor, viaok)
 	if err != nil {
 		return nil, err
 	}
@@ -263,22 +261,27 @@ func NewPipProxy(ctx context.Context, ctl protect.Controller, px ProxyProvider, 
 	return t, nil
 }
 
+func (t *piph2) viafor() *Proxy {
+	return viafor(idstr(t), t.viaID.Load(), t.px)
+}
+
+func (t *piph2) swapVia(new Proxy) Proxy {
+	return swapVia(idstr(t), new, t.viaID, t.via)
+}
+
 // ID implements Proxy.
-func (t *piph2) ID() string {
-	return RpnH2
+func (t *piph2) ID() *x.Gostr {
+	return x.StrOf(RpnH2)
 }
 
 // Type implements Proxy.
-func (t *piph2) Type() string {
-	return PIPH2
+func (t *piph2) Type() *x.Gostr {
+	return x.StrOf(PIPH2)
 }
 
 // GetAddr implements Proxy.
-func (t *piph2) GetAddr() string {
-	if a := t.lastaddr.Load(); a != nil {
-		return *a
-	}
-	return t.hostname + ":" + strconv.Itoa(t.port)
+func (t *piph2) GetAddr() *x.Gostr {
+	return x.StrOf(t.hostname + ":" + strconv.Itoa(t.port))
 }
 
 // Router implements Proxy.
@@ -287,38 +290,34 @@ func (t *piph2) Router() x.Router {
 }
 
 // Reaches implements x.Router.
-func (t *piph2) Reaches(hostportOrIPPortCsv string) bool {
-	return Reaches(t, hostportOrIPPortCsv)
-}
-
-// Self implements x.Router.
-func (t *piph2) Self(ip string) bool {
-	if ip == "" {
-		return false
-	}
-	for _, a := range dialers.CachedAddrs(t.hostname) {
-		if a.String() == ip {
-			return true
-		}
-	}
-	return t.GW.Self(ip)
+func (t *piph2) Reaches(hostportOrIPPortCsv *x.Gostr) bool {
+	return Reaches(t, hostportOrIPPortCsv.V())
 }
 
 // Hop implements Proxy.
-func (t *piph2) Hop(via *core.WeakRef[Proxy], dryrun bool) error {
+func (t *piph2) Hop(p Proxy, dryrun bool) error {
+	if p == nil {
+		if !dryrun {
+			old := t.swapVia(nil)
+			log.I("piph2: hop(%s) removed", idhandle(old))
+		}
+		return nil
+	}
+	if p.Status() == END {
+		return errProxyStopped
+	}
+
 	if !dryrun {
-		old := t.via.Swap(via)
-		log.I("piph2: hop %s => %s", refhandle(old), refhandle(via))
+		old := t.swapVia(p)
+		log.I("piph2: hop %s => %s", idhandle(old), idhandle(p))
 	}
 	return nil
 }
 
 // Via implements x.Router.
 func (t *piph2) Via() (x.Proxy, error) {
-	if ref := t.via.Load(); ref != nil {
-		if v, ok := ref.Get(); ok && v != nil {
-			return v, nil
-		}
+	if v := t.via.Load(); v != nil {
+		return v, nil
 	}
 	return nil, errNoHop
 }
@@ -331,12 +330,9 @@ func (t *piph2) Stop() error {
 }
 
 // Status implements Proxy.
-func (t *piph2) Status() int32 {
+func (t *piph2) Status() int {
 	st := t.status.Load()
-	if candial2(st) != nil {
-		return st // paused or ended
-	}
-	if idling(t.lastdial.Load()) {
+	if st != END && idling(t.lastdial.Load()) {
 		return TZZ
 	}
 	return st
@@ -350,7 +346,7 @@ func (h *piph2) Pause() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TPU)
+	ok := h.status.Cas(st, TPU)
 	log.I("proxy: piph2: paused? %t", ok)
 	return ok
 }
@@ -363,7 +359,7 @@ func (h *piph2) Resume() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TUP)
+	ok := h.status.Cas(st, TUP)
 	go h.Refresh() // no-op since SkipRefresh
 	log.I("proxy: piph2: resumed? %t", ok)
 	return ok
@@ -380,13 +376,13 @@ func (t *piph2) claim(msg string) []string {
 }
 
 // Handle implements Proxy.
-func (t *piph2) Handle() uint64 {
-	return t.hdl
+func (t *piph2) Handle() uintptr {
+	return core.Loc(t)
 }
 
 // DialerHandle implements Proxy.
-func (t *piph2) DialerHandle() uint64 {
-	return t.dhdl
+func (t *piph2) DialerHandle() uintptr {
+	return core.Loc(t.outbound)
 }
 
 // Dial implements Proxy.
@@ -402,7 +398,7 @@ func (t *piph2) DialBind(network, local, remote string) (protect.Conn, error) {
 }
 
 func (t *piph2) forward(network, addr string) (protect.Conn, error) {
-	if err := candial(&t.status); err != nil {
+	if err := candial(t.status); err != nil {
 		return nil, errProxyStopped
 	}
 	if network != "tcp" {
@@ -465,9 +461,6 @@ func (t *piph2) forward(network, addr string) (protect.Conn, error) {
 			}
 			oconn.laddr = info.Conn.LocalAddr()
 			oconn.raddr = info.Conn.RemoteAddr()
-			if a, ok := laddr(info.Conn); ok {
-				t.lastaddr.Store(&a)
-			}
 			log.D("piph2: GotConn([%v -> %v] (via %v))", oconn.laddr, addr, oconn.raddr)
 		},
 		PutIdleConn: func(err error) {
@@ -536,7 +529,7 @@ func (t *piph2) forward(network, addr string) (protect.Conn, error) {
 		// req.Header.Set("x-nile-pip-msg", msg)
 	}
 
-	t.lastdial.Store(now())
+	t.lastdial.Store(time.Now())
 	core.Go("piph2.Dial", func() {
 		// fixme: currently, this hangs forever when upstream is cloudflare
 		// setting the content-length to the first len(first-write-bytes) works

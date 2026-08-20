@@ -99,19 +99,9 @@ func (f *icmpForwarder) reply4(id stack.TransportEndpointID, pkt *stack.PacketBu
 
 	l3 := pkt.Network() // same as ipHdr; l3.Dst == id.LocalAddr and l3.Src == id.RemoteAddr
 	route, err := f.s.FindRoute(pkt.NICID, localAddr, l3.SourceAddress(), pkt.NetworkProtocolNumber, false /* multicastLoop */)
-	if err != nil {
-		log.W("icmp: v4: %s: no route on %v to %s <= %s; err: %v",
-			f.o, pkt.NICID, l3.DestinationAddress(), l3.SourceAddress(), err)
-		replyData.Release()
-		return // not handled
-	}
-
-	// Check replyData size after acquiring route
-	if replyData.Size() <= 0 {
-		log.W("icmp: v4: %s: empty reply data; sz: (l3hdr: %d / l4hdr: %d / payload: %d)",
-			f.o, len(l3hdr), len(l4hdr), replyData.Size())
-		replyData.Release()
-		route.Release()
+	if err != nil || replyData.Size() <= 0 {
+		log.W("icmp: v4: %s: no route on %v to %s <= %s; sz: (l3hdr: %d / l4hdr: %d / payload: %d)",
+			f.o, pkt.NICID, l3.DestinationAddress(), l3.SourceAddress(), len(l3hdr), len(l4hdr), replyData.Size())
 		return // not handled
 	}
 
@@ -119,8 +109,6 @@ func (f *icmpForwarder) reply4(id stack.TransportEndpointID, pkt *stack.PacketBu
 	data, derr := l4l7(pkt, route.MTU())
 	if derr != nil {
 		log.E("icmp: v4: %s: err getting payload: %v", f.o, derr)
-		replyData.Release()
-		route.Release()
 		return // not handled
 	}
 
@@ -209,8 +197,7 @@ func (f *icmpForwarder) reply6(id stack.TransportEndpointID, pkt *stack.PacketBu
 	data, derr := l4l7(pkt, route.MTU())
 	if derr != nil || len(data) <= 0 {
 		log.E("icmp: v6: %s: payload (sz: %d) err: %v", f.o, len(data), derr)
-		route.Release()
-		return // not handled; route released above, l4l7 cleans up internally
+		return // not handled
 	}
 
 	if settings.Debug {
@@ -230,7 +217,6 @@ func (f *icmpForwarder) reply6(id stack.TransportEndpointID, pkt *stack.PacketBu
 		if !f.h.Ping(data, src, dst) { // unreachable
 			err = f.icmpErr6(id, pkt, header.ICMPv6DstUnreachable, header.ICMPv6NetworkUnreachable)
 		} else { // reachable
-			// ICMPv6EchoMinimumSize is 8: type(1) + code(1) + checksum(2) + ident(2) + seq(2)
 			replyPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				ReserveHeaderBytes: int(route.MaxHeaderLength()) + header.ICMPv6EchoMinimumSize,
 				Payload:            pkt.Data().ToBuffer(),
@@ -240,7 +226,6 @@ func (f *icmpForwarder) reply6(id stack.TransportEndpointID, pkt *stack.PacketBu
 			replyPkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
 			copy(replyHdr, hdr)
 			replyHdr.SetType(header.ICMPv6EchoReply)
-			replyHdr.SetCode(0) // RFC 4443: Echo Reply must have Code=0
 			replyData := replyPkt.Data()
 			replyHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 				Header:      replyHdr,
@@ -382,8 +367,6 @@ func (f *icmpForwarder) icmpErr4(pkt *stack.PacketBuffer, icmpType header.ICMPv4
 		ReserveHeaderBytes: int(route.MaxHeaderLength()) + header.ICMPv4MinimumSize,
 		Payload:            payload,
 	})
-	// WriteHeaderIncludedPacket consumes one reference; IncRef keeps
-	// the deferred DecRef safe.
 	icmpPkt.IncRef()
 	defer icmpPkt.DecRef()
 
@@ -466,9 +449,6 @@ func (f *icmpForwarder) icmpErr6(id stack.TransportEndpointID, pkt *stack.Packet
 	defer route.Release()
 
 	network, transport := pkt.NetworkHeader().View(), pkt.TransportHeader().View()
-	// Release buffer views when function returns
-	defer network.Release()
-	defer transport.Release()
 
 	// As per RFC 4443 section 2.4
 	//
@@ -505,8 +485,6 @@ func (f *icmpForwarder) icmpErr6(id stack.TransportEndpointID, pkt *stack.Packet
 		Payload:            payload,
 	})
 	icmpPkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
-	// WriteHeaderIncludedPacket consumes one reference; IncRef keeps
-	// the deferred DecRef safe.
 	icmpPkt.IncRef()
 	defer icmpPkt.DecRef()
 
@@ -543,29 +521,25 @@ func l4l7(pkt *stack.PacketBuffer, sz uint32) ([]byte, error) {
 	r := make([]byte, 0, sz)
 	din := buffer.MakeWithData(r)
 	l4 := pkt.TransportHeader().View()
-	if err := din.Append(l4); err != nil {
+	err := din.Append(l4)
+	if err != nil {
 		log.E("icmp: l4l7: err appending transport header: %v", err)
-		din.Release()
 		return nil, err
 	}
 	l7 := pkt.Data().ToBuffer()
-	din.Merge(&l7)       // l4 + l7; din now owns l4's chunks + l7's chunks
-	out := din.Flatten() // flatten allocates a new []byte copying the data
-	din.Release()        // release buffer chunks; out is the owned copy
-	return out, nil
+	din.Merge(&l7) // l4 + l7
+	return din.Flatten(), nil
 }
 
 func l3l4(pkt *stack.PacketBuffer, sz int64) (b buffer.Buffer, err error) {
 	l3 := pkt.NetworkHeader().View()
 	l4 := pkt.TransportHeader().View()
 	combined := buffer.MakeWithView(l3)
-	if err = combined.Append(l4); err != nil {
-		combined.Release()
-		return
+	if err = combined.Append(l4); err == nil {
+		payload := pkt.Data().ToBuffer()
+		combined.Merge(&payload)
+		combined.Truncate(sz)
+		b = combined
 	}
-	payload := pkt.Data().ToBuffer()
-	combined.Merge(&payload)
-	combined.Truncate(sz)
-	b = combined // caller takes ownership of the returned buffer
 	return
 }

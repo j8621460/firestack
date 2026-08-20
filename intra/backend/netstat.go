@@ -32,7 +32,7 @@ type TUNStat struct {
 	Open     bool
 	Up       bool
 	Mtu      int32
-	Sid      int64
+	Sid      int
 	EpStats  string
 	PcapMode string
 }
@@ -155,6 +155,8 @@ type RDNSInfo struct {
 	NewWireGuard            string
 	Transparency            bool
 	HappyEyeballs           bool
+	PanicTest               bool
+	FatalTest               bool
 	SystemDNSForUndelegated bool
 	DefaultDNSAsFallback    bool
 	SetUserAgent            bool
@@ -166,7 +168,6 @@ type RDNSInfo struct {
 	Dialer6    bool
 	DialerOpts string
 	TunMode    string
-	DNS64Pfx   string
 
 	DNSPreferred string
 	DNSDefault   string
@@ -236,16 +237,6 @@ type GoStat struct {
 	Env  string // environment variables
 }
 
-type GoMetrics struct {
-	G GoStat
-	M string
-	C string
-	L string
-}
-
-// GO returns the Go runtime statistics.
-func (g *GoMetrics) GO() *GoStat { return &g.G }
-
 // NetStat is a collection of network engine statistics.
 type NetStat struct {
 	NICSt  NICStat
@@ -257,6 +248,7 @@ type NetStat struct {
 	TCPSt  TCPStat
 	UDPSt  UDPStat
 	RDNSIn RDNSInfo
+	GOSt   GoStat
 }
 
 // NIC returns the network interface statistics.
@@ -285,3 +277,6 @@ func (n *NetStat) UDP() *UDPStat { return &n.UDPSt }
 
 // RDNS returns the RDNS settings / info.
 func (n *NetStat) RDNSINFO() *RDNSInfo { return &n.RDNSIn }
+
+// GO returns the Go runtime statistics.
+func (n *NetStat) GO() *GoStat { return &n.GOSt }

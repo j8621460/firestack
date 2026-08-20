@@ -170,7 +170,7 @@ func (f *Flow[T]) Swap(new T) (old T) {
 
 func (f *Flow[T]) Tango(new T) (old T) {
 	defer func() {
-		if !loceq(new, old) {
+		if !LocEq(new, old) {
 			f.pub(new)
 		}
 	}()

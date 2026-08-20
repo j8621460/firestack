@@ -59,8 +59,8 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
 
 	h.maybeReplaceDest(res, &target)
 
-	preferred, _, _ := filterFamilyForDialing(h.resolver, realips)
-	dst := h.oneRealIPPort(preferred, target, !undidAlg)
+	preferred, _, _ := filterFamilyForDialing(realips)
+	dst := oneRealIPPort(preferred, target, !undidAlg)
 	// on Android, uid is always "unknown" for icmp
 	cid, uid, _, pids := h.judge(res)
 	smm := icmpSummary(cid, uid)
@@ -68,10 +68,10 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
 	defer func() {
 		smm.PID = pidstr(px)
 		smm.RPID = ipn.ViaID(px)
-		smm.Target = dst.Addr().String()
 		smm.Tx = int64(tx)
 		smm.Rx = int64(rx)
 		smm.Rtt = rtt.Milliseconds()
+		smm.Target = dst.Addr().String()
 		h.queueSummary(smm.done(err)) // err may be nil
 	}()
 
@@ -94,28 +94,10 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
 		return false // denied
 	}
 
-	if px, err = h.prox.ProxyTo(cid, dst, "icmp", uid, pids); err != nil || px == nil {
+	if px, err = h.prox.ProxyTo(dst, uid, pids); err != nil || px == nil {
 		err = log.EE("t.icmp: egress: no proxy(%s); err %v", pids, err)
 		return false // denied
 	}
-
-	smm.PID = pidstr(px)
-	smm.RPID = ipn.ViaID(px)
-	smm.Target = dst.Addr().String()
-
-	if h.loopDetected(smm) {
-		log.I("t.icmp: loop: break %s: %s => %s via %s for %s; exiting...", cid, source, dst, pidstr(px), uid)
-		px, err = h.prox.ProxyTo(cid, dst, "icmp", uid, onlyExitPid)
-		smm.PID = ipn.Exit
-		smm.RPID = ""
-	}
-
-	if px == nil || err != nil {
-		return false // unhandled
-	}
-
-	h.loopAssoc(smm)
-	defer h.loopUnassoc(smm)
 
 	rttstart := time.Now()
 	proto, anyaddr := anyaddrFor(dst)
@@ -136,7 +118,7 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
 	defer h.conntracker.Untrack(cid)
 
 	awaited := core.Await(func() {
-		h.flowing(smm)
+		h.listener.PostFlow(smm.postMark())
 	}, onFlowTimeout)
 
 	tx = len(msg)

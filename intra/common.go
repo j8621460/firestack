@@ -12,14 +12,15 @@ import (
 	"math/rand"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"slices"
 
+	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/dialers"
 	"github.com/celzero/firestack/intra/dnsx"
@@ -32,28 +33,16 @@ import (
 )
 
 const (
-	smmchSize       = 256 // some comfortably high number
-	UNKNOWN_UID     = core.UNKNOWN_UID
-	UNKNOWN_UID_STR = core.UNKNOWN_UID_STR
-	// ANDROID_UID         = core.ANDROID_UID
-	ANDROID_UID_STR     = core.ANDROID_UID_STR
+	smmchSize           = 256 // some comfortably high number
+	UNKNOWN_UID         = core.UNKNOWN_UID
+	UNKNOWN_UID_STR     = core.UNKNOWN_UID_STR
+	SELF_UID            = protect.UidSelf
 	UNSUPPORTED_NETWORK = core.UNSUPPORTED_NETWORK
 )
-
-var SELF_UID = protect.MyUid
 
 const (
 	HDLOK = iota
 	HDLEND
-)
-
-const (
-	retryTimeout = 15 * time.Second
-
-	// onFlowTimeout takes in to account "testWithBackoff" on Kolin side (which is around 9s)
-	onFlowTimeout    = 15 * time.Second
-	onPreFlowTimeout = 5 * time.Second
-	onInFlowTimeout  = 5 * time.Second
 )
 
 var (
@@ -61,21 +50,19 @@ var (
 	anyaddr6 = netip.IPv6Unspecified()
 )
 
-var onlyExitPid = []string{ipn.Exit}
-
 // immediate is the wait time before sending a summary to the listener.
 var immediate = time.Duration(0)
 
 // zeroListener is a no-op implementation of SocketListener.
 type zeroListener struct{}
 
-var _ FlowListener = (*zeroListener)(nil)
+var _ SocketListener = (*zeroListener)(nil)
 
-func (*zeroListener) Preflow(_, _ int32, _, _ string) *PreMark               { return nil }
-func (*zeroListener) Flow(_, _ int32, _, _, _, _, _, _ string, _ bool) *Mark { return nil }
-func (*zeroListener) Inflow(_, _ int32, _, _ string) *Mark                   { return nil }
-func (*zeroListener) Flowing(*Mark)                                          {}
-func (*zeroListener) Postflow(*FlowSummary)                                  {}
+func (*zeroListener) Preflow(_, _ int32, _, _ *x.Gostr) *PreMark       { return nil }
+func (*zeroListener) Flow(_, _ int32, _, _, _, _, _, _ *x.Gostr) *Mark { return nil }
+func (*zeroListener) Inflow(_, _ int32, _, _ *x.Gostr) *Mark           { return nil }
+func (*zeroListener) PostFlow(*Mark)                                   {}
+func (*zeroListener) OnSocketClosed(*SocketSummary)                    {}
 
 var nooplistener = new(zeroListener)
 
@@ -85,37 +72,33 @@ type baseHandler struct {
 
 	resolver dnsx.Resolver     // dns resolver to forward queries to
 	prox     ipn.ProxyProvider // proxy provider
-	smmch    chan *FlowSummary
-	listener FlowListener // listener for socket summaries
+	smmch    chan *SocketSummary
+	listener SocketListener // listener for socket summaries
 
 	conntracker core.ConnMapper              // connid -> [local,remote]
 	fwtracker   *core.ExpMap[string, string] // uid+dst(domainOrIP) -> blockSecs
-
-	ltmu        sync.RWMutex
-	looptracker map[string]uint64 // dst -> count
 
 	once sync.Once
 
 	// fields below are mutable
 
-	status atomic.Int32 // status of this handler
+	status *core.Volatile[int] // status of this handler
 }
 
 var _ netstack.GBaseConnHandler = (*baseHandler)(nil)
 
-func newBaseHandler(pctx context.Context, proto string, r dnsx.Resolver, px ipn.ProxyProvider, l FlowListener) *baseHandler {
+func newBaseHandler(pctx context.Context, proto string, r dnsx.Resolver, px ipn.ProxyProvider, l SocketListener) *baseHandler {
 	h := &baseHandler{
 		ctx:         pctx,
 		proto:       proto,
 		resolver:    r,
 		prox:        px,
-		smmch:       make(chan *FlowSummary, smmchSize),
+		smmch:       make(chan *SocketSummary, smmchSize),
 		listener:    l,
-		fwtracker:   core.NewExpiringMap[string, string](pctx, proto+".fwtrack"),
-		conntracker: core.NewConnMap(proto + ".conntrack"),
-		looptracker: make(map[string]uint64),
+		fwtracker:   core.NewExpiringMap[string, string](pctx),
+		conntracker: core.NewConnMap(),
+		status:      core.NewVolatile(HDLOK),
 	}
-	h.status.Store(HDLOK)
 	context.AfterFunc(pctx, h.End)
 	return h
 }
@@ -134,8 +117,8 @@ func (h *baseHandler) onInflow(to, from netip.AddrPort) (fm *Mark) {
 
 	// inflow does not go through nat/alg/dns/proxy
 	fm, ok := core.Grx(h.proto+".inflow", func(_ context.Context) (*Mark, error) {
-		return h.listener.Inflow(nn, int32(uid), to.String(), from.String()), nil
-	}, onInFlowTimeout)
+		return h.listener.Inflow(nn, int32(uid), x.StrOf(to.String()), x.StrOf(from.String())), nil
+	}, onFlowTimeout)
 
 	if !ok || fm == nil {
 		fm = optionsBlock // fail-safe: block everything
@@ -165,13 +148,6 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 		if procEntry != nil {
 			uid = procEntry.UserID
 			preuid = strconv.Itoa(uid)
-		} else {
-			// TODO: ipmapper wouldn't call into LookupFor (instead call into LocalLookup)
-			// when preuid (uid) is UNKNOWN_UID which is not what we want with ResolveFor
-			// call made below; that is, we want ResolveFor to call into ipmapper to then
-			// in to LookupFor so dnsx.Fixed would be the chosen transport?
-			// uid = ANDROID_UID
-			// preuid = ANDROID_UID_STR
 		}
 	}
 
@@ -187,8 +163,8 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 	var pdoms, blocklists string
 
 	pre, _ := core.Grx(h.proto+".preflow", func(_ context.Context) (*PreMark, error) {
-		return h.listener.Preflow(proto, int32(uid), src, dst), nil
-	}, onPreFlowTimeout)
+		return h.listener.Preflow(proto, int32(uid), x.StrOf(src), x.StrOf(dst)), nil
+	}, onFlowTimeout)
 
 	hasPre := pre != nil
 	if hasPre && pre != nil /*nilaway*/ && len(pre.UID) > 0 {
@@ -206,7 +182,7 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 		}
 	}
 
-	if log.Verbose {
+	if settings.Debug {
 		log.VV("com: %s: onFlow: preflow: has? %t, preuid: %s for %s => %s", h.proto, hasPre, preuid, src, dst)
 	}
 
@@ -219,14 +195,12 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 		if hasPre {
 			for d := range strings.SplitSeq(doms, ",") {
 				nodomain := len(d) <= 0
-				if nodomain {
-					if log.Verbose {
-						logwif(len(d) <= 0)("com: %s: onFlow: preflow: %v from %v => %v for %s; nodomain? %t",
-							h.proto, doms, src, target, preuid, nodomain)
-					}
+				if nodomain && settings.Debug {
+					logwif(len(d) <= 0)("com: %s: onFlow: preflow: %v from %v => %v for %s; nodomain? %t",
+						h.proto, doms, src, target, preuid, nodomain)
 					continue
 				}
-				newips, err := dialers.ResolveFor(h.resolver, d, preuid)
+				newips, err := dialers.ResolveFor(d, preuid)
 				hasNewIPs = err == nil && len(newips) > 0
 				logwif(!hasNewIPs)("com: %s: onFlow: preflow: resolved alg domain %s? %t; new ips %v for %s => %s; preuid: %s",
 					h.proto, d, hasNewIPs, newips, src, dst, preuid)
@@ -245,23 +219,22 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 			return fm, undidAlg, "", ""
 		} // else: if we've got target and/or old ips, dial them
 	} else {
-		if log.Debug {
+		if settings.Debug {
 			log.D("com: %s: onFlow: noalg? %t or hasips? %t for %s => %s; preuid %s",
 				h.proto, !undidAlg, hasOldIPs, src, dst, preuid)
 		}
 	}
 
-	if log.Debug && (len(ips) <= 0 || len(doms) <= 0) {
+	if settings.Debug && (len(ips) <= 0 || len(doms) <= 0) {
 		log.D("com: %s: onFlow: no realips(%s) or domains(%s + %s), for src=%s dst=%s; preuid=%s; alg? %t",
 			h.proto, ips, doms, pdoms, localaddr, target, preuid, undidAlg)
 	}
 
-	// note the loopback status before listener.Flow.
-	loopback := settings.Loopingback.Load()
-
 	fm, ok := core.Grx(h.proto+".flow", func(_ context.Context) (*Mark, error) {
-		return h.listener.Flow(proto, int32(uid), src, dst, ips, doms, pdoms, blocklists, undidAlg), nil
+		return h.listener.Flow(proto, int32(uid), x.StrOf(src), x.StrOf(dst), x.StrOf(ips), x.StrOf(doms), x.StrOf(pdoms), x.StrOf(blocklists)), nil
 	}, onFlowTimeout)
+
+	loopback := settings.Loopingback.Load()
 
 	if fm == nil || !ok { // zeroListener returns nil
 		log.W("com: %s: onFlow: empty res or on flow timeout %t; block!", h.proto, ok)
@@ -282,7 +255,7 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 	// in other cases, routing Rethink via remote proxies is probably a bug.
 	if !loopback && preuid == SELF_UID && !ipn.IsAnyLocalProxy(strings.Split(fm.PIDCSV, ",")...) {
 		egress := ipn.Exit
-		if h.resolver.IsDnsAddrPort(target) {
+		if h.resolver.IsDnsAddr(target) {
 			egress = ipn.Base // see: udp.go:dnsOverride
 		}
 		log.W("com: %s: onFlow: preflow: preuid %s (%s => %s) is rethink (loopback? %t)! override %s to %s!",
@@ -298,7 +271,7 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 // remote, wired to egress, is wrapped in rwext; but the underlying conn may
 // be *net.TCPConn, *net.UDPConn, *demuxconn, or dialers.retrier|splitter etc.
 // It also sends a summary to the listener when done. Always called in a goroutine.
-func (h *baseHandler) forward(local, remote net.Conn, smm *FlowSummary) {
+func (h *baseHandler) forward(local, remote net.Conn, smm *SocketSummary) {
 	cid := smm.ID
 	uid := smm.UID
 	pid := smm.PID
@@ -324,23 +297,22 @@ func (h *baseHandler) forward(local, remote net.Conn, smm *FlowSummary) {
 	log.I("com: %s: forward: new conn %s rwext? %t (%T), optset? %t (%ds); %s for %s",
 		h.proto, via, isrwext, remote, didSet, timeoutsecs, tup, uid)
 
-	uploadch := make(chan ioinfo, 1)
+	uploadch := make(chan ioinfo)
 
 	go upload(via, local, remote, uploadch)
 	dbytes, derr := download(via, local, remote)
 
-	uploaded := <-uploadch
+	upload := <-uploadch
 
 	// remote conn could be dialed in to some proxy; and so,
 	// its remote addr may not be the same as smm.Target
 	smm.Rx = dbytes
-	smm.Tx = uploaded.bytes
+	smm.Tx = upload.bytes
 
-	h.queueSummary(smm.done(derr, uploaded.err))
+	h.queueSummary(smm.done(derr, upload.err))
 }
 
-// queueSummary queues a summary to be sent to the listener; thread-safe.
-func (h *baseHandler) queueSummary(s *FlowSummary) {
+func (h *baseHandler) queueSummary(s *SocketSummary) {
 	if s == nil {
 		return
 	}
@@ -353,7 +325,7 @@ func (h *baseHandler) queueSummary(s *FlowSummary) {
 	// log.VV("com: %s: queueSummary: %x %x %s", h.proto, h.smmch, h.ctx, s.ID)
 	select {
 	case <-h.ctx.Done():
-		if log.Debug {
+		if settings.Debug {
 			log.D("%s: queueSummary: end: %s", h.proto, s)
 		}
 	default:
@@ -374,10 +346,7 @@ func (h *baseHandler) processSummaries() {
 		select {
 		case <-h.ctx.Done():
 			return
-		case s, ok := <-h.smmch:
-			if !ok {
-				return // channel closed by End()
-			}
+		case s := <-h.smmch:
 			if s != nil && len(s.ID) > 0 {
 				h.sendSummary(s, immediate)
 			}
@@ -385,8 +354,7 @@ func (h *baseHandler) processSummaries() {
 	}
 }
 
-// sendSummary sends a summary to the listener; thread-safe.
-func (h *baseHandler) sendSummary(s *FlowSummary, after time.Duration) {
+func (h *baseHandler) sendSummary(s *SocketSummary, after time.Duration) {
 	defer core.Recover(core.DontExit, "c.sendNotif: "+s.ID)
 
 	if after > 0 {
@@ -396,10 +364,10 @@ func (h *baseHandler) sendSummary(s *FlowSummary, after time.Duration) {
 		time.Sleep(after)
 	}
 
-	if log.Verbose {
+	if settings.Debug {
 		log.VV("com: %s: end? sendNotif: %s", h.proto, s)
 	}
-	h.listener.Postflow(s) // s.Duration may be uninitialized (zero)
+	h.listener.OnSocketClosed(s) // s.Duration may be uninitialized (zero)
 }
 
 // OpenConns implements netstack.GBaseConnHandler
@@ -454,89 +422,16 @@ func (h *baseHandler) stall(flowid string) (secs uint32) {
 	return
 }
 
-func (h *baseHandler) loopAssoc(smm *FlowSummary) (y bool) {
-	if smm == nil || smm.UID != SELF_UID || ipn.Exit == smm.PID || len(smm.Target) <= 0 {
-		return false
-	}
-	h.ltmu.Lock()
-	defer h.ltmu.Unlock()
-
-	if settings.Loopingback.Load() {
-		if len(h.looptracker) > 0 {
-			clear(h.looptracker)
-		}
-		return false
-	}
-
-	k := looptrackerKey(smm)
-	v, loaded := h.looptracker[k]
-	if !loaded {
-		h.looptracker[k] = 1
-	} else {
-		h.looptracker[k] = v + 1
-	}
-	return true
-}
-
-func (h *baseHandler) loopDetected(smm *FlowSummary) (y bool) {
-	if smm == nil || smm.UID != SELF_UID || ipn.Exit == smm.PID || len(smm.Target) <= 0 {
-		return false
-	}
-	h.ltmu.RLock()
-	defer h.ltmu.RUnlock()
-
-	if v, ok := h.looptracker[looptrackerKey(smm)]; ok {
-		return v >= 1
-	}
-	return false
-}
-
-func (h *baseHandler) loopUnassoc(smm *FlowSummary) (y bool) {
-	if smm == nil || smm.UID != SELF_UID || ipn.Exit == smm.PID || len(smm.Target) <= 0 {
-		return false
-	}
-
-	h.ltmu.Lock()
-	defer h.ltmu.Unlock()
-	if !settings.Loopingback.Load() {
-		if len(h.looptracker) > 0 {
-			clear(h.looptracker)
-		}
-		return false
-	}
-
-	k := looptrackerKey(smm)
-	v, loaded := h.looptracker[k]
-	if !loaded {
-		return false
-	}
-	if v <= 1 {
-		delete(h.looptracker, k)
-	} else {
-		h.looptracker[k] = v - 1
-	}
-	return true
-}
-
 func (h *baseHandler) isDNS(addr netip.AddrPort) bool {
-	return addr.IsValid() && h.resolver.IsDnsAddrPort(addr)
+	return addr.IsValid() && h.resolver.IsDnsAddr(addr)
 }
 
-func (h *baseHandler) dnsOverride(conn net.Conn, uid string, smm *FlowSummary) bool {
+func (h *baseHandler) dnsOverride(conn net.Conn, uid string) bool {
 	// addr with zone information removed; see: netip.ParseAddrPort which h.resolver relies on
 	// addr2 := &net.TCPAddr{IP: addr.IP, Port: addr.Port}
 	// conn closed by the resolver
-	fid := smm.ID // flow ID that spawned this DNS query
 	core.Gx(h.proto+".dns", func() {
-		// SocketSummary is not meant to be used by the listener; x.DNSSummary is
-		// but call into PostFlow & OnSocketClosed anyway, to avoid ambiguities
-		// on which sockets / sessions are still active.
-		rx, tx, errs := h.resolver.Serve(h.proto, conn, uid, fid)
-		smm.Rx = rx
-		smm.Tx = tx
-		// smm.Rtt
-		// smm.Target = DNS resolver?
-		h.listener.Postflow(smm.done(errs...))
+		h.resolver.Serve(h.proto, conn, uid)
 	})
 	return true
 }
@@ -551,26 +446,9 @@ func (h *baseHandler) End() {
 	})
 }
 
-// Reset implements [netstack.GBaseConnHandler].
-func (h *baseHandler) Reset() {
-	if h == nil {
-		return
-	}
-	// handlers may be shared across restarts (see: rtunnel.Restart)
-	// Stale per-stack state (open conns, loop-detection counts)
-	// from the previous stack need not carry over. Unlike End(),
-	// Reset is not terminal: smmch stays open.
-	h.CloseConns(nil) // close all conns tracked from the old stack
-	h.ltmu.Lock()
-	clear(h.looptracker) // reset loop-detection counts
-	h.ltmu.Unlock()
-	h.status.Store(HDLOK) // re-arm
-	log.I("com: %s: handler reset", h.proto)
-}
-
-// upload copies data from remote to local, and returns the number of bytes copied and error, if any.
 // TODO: Propagate TCP RST using local.Abort(), on appropriate errors.
 func upload(id string, local, remote net.Conn, ioch chan<- ioinfo) {
+	debug.SetPanicOnFault(true)
 	defer core.Recover(core.Exit11, "c.upload."+id)
 	defer core.CloseOp(local, core.CopR)
 	defer core.CloseOp(remote, core.CopW)
@@ -578,33 +456,31 @@ func upload(id string, local, remote net.Conn, ioch chan<- ioinfo) {
 
 	n, err := core.Pipe(remote, local)
 
-	if log.Debug {
+	if settings.Debug {
 		log.D("com: %s upload(%d) done(%v) b/w %s",
 			id, n, err, conn2str(local, remote))
 	}
 	ioch <- ioinfo{n, err}
 }
 
-// download copies data from local to remote, and returns the number of bytes copied and error, if any.
 func download(id string, local, remote net.Conn) (n int64, err error) {
 	defer core.CloseOp(local, core.CopW)
 	defer core.CloseOp(remote, core.CopR)
 
 	n, err = core.Pipe(local, remote)
 
-	if log.Debug {
+	if settings.Debug {
 		log.D("com: %s download(%d) done(%v) b/w %s",
 			id, n, err, conn2str(local, remote))
 	}
 	return
 }
 
-// oneRealIPPort returns the first valid AddrPort from realips, or origipp if none are valid.
-func (h *baseHandler) oneRealIPPort(realips []netip.Addr, origipp netip.AddrPort, maybeIncludeOrig bool) netip.AddrPort {
+func oneRealIPPort(realips []netip.Addr, origipp netip.AddrPort, maybeIncludeOrig bool) netip.AddrPort {
 	if len(realips) <= 0 {
 		return origipp
 	}
-	if first := makeIPPorts(h.resolver, realips, origipp, maybeIncludeOrig, 1); len(first) > 0 {
+	if first := makeIPPorts(realips, origipp, maybeIncludeOrig, 1); len(first) > 0 {
 		return first[0]
 	}
 	return origipp
@@ -623,13 +499,9 @@ func makeAnyAddrPort(origipp netip.AddrPort) netip.AddrPort {
 // makeIPPorts returns a slice of valid, non-zero at most cap AddrPorts.
 // The first element may be origipp AddrPort, if realips is empty or contains only unspecified IPs.
 // or maybeIncludeOrig is true and origipp's IP family is included in dialer's current config.
-// It may add DNS64 prefix of the local network to IPv4 addresses.
-func makeIPPorts(r dnsx.Resolver, ips []netip.Addr, origipp netip.AddrPort, maybeIncludeOrig bool, cap int) []netip.AddrPort {
-	// client sets force46 is true if the dialers report v4 but the underlying network is v6
-	force46 := settings.PtMode.Load() == settings.PtModeForce || settings.PtMode.Load() == settings.PtModeForce46
+func makeIPPorts(ips []netip.Addr, origipp netip.AddrPort, maybeIncludeOrig bool, cap int) []netip.AddrPort {
 	use4 := dialers.Use4()
 	use6 := dialers.Use6()
-	only6 := !use4 && use6
 	orig4 := origipp.Addr().Is4()
 	orig6 := origipp.Addr().Is6()
 
@@ -646,89 +518,64 @@ func makeIPPorts(r dnsx.Resolver, ips []netip.Addr, origipp netip.AddrPort, mayb
 
 	origip := origipp.Addr()
 	origport := origipp.Port()
-
-	var origipp46 netip.AddrPort
-	if v := origipp.Addr(); v.Is4() {
-		if v6 := r.X46(dnsx.System, v); ipok(v6) {
-			origipp46 = netip.AddrPortFrom(v6, origport)
-		}
-	}
-
-	useOrig46 := orig4 && (only6 || force46) && ipok(origipp46.Addr())
 	willIncludeOrig := maybeIncludeOrig && ((use4 && orig4) || (use6 && orig6))
-	out := make([]netip.AddrPort, 0, cap)
+	r := make([]netip.AddrPort, 0, cap)
 	// override alg-ip with the first real-ip
 	for _, v := range ips { // may contain unspecifed ips
-		if len(out) >= cap {
+		if len(r) >= cap {
 			break
 		}
 		if v == origip && willIncludeOrig {
 			// skip duplicate of origipp which will be included later
 			continue
 		}
-		if ipok(v) {
-			if v.Is4() && (only6 || force46) {
-				if v6 := r.X46(dnsx.System, v); ipok(v6) {
-					v = v6
-				}
-			}
-			out = append(out, netip.AddrPortFrom(v, origport))
+		if v.IsValid() && !v.IsUnspecified() {
+			r = append(r, netip.AddrPortFrom(v, origport))
 		} // else: discard ip
 	}
 
-	if log.Verbose {
-		log.V("com: makeIPPorts(v4? %t, v6? %t, 46? %t) for %v [orig46? %t %v]; tot: %d; in: %v, out: %v",
-			use4, use6, force46, origipp, useOrig46, origipp46, len(ips), ips, out)
+	if settings.Debug {
+		log.VV("com: makeIPPorts(v4? %t, v6? %t) for %v; tot: %d; in: %v, out: %v",
+			use4, use6, origipp, len(ips), ips, r)
 	}
-	if len(out) > 0 {
-		s := core.ShuffleInPlace(out)
+
+	if len(r) > 0 {
+		s := core.ShuffleInPlace(r)
 		if willIncludeOrig {
-			if useOrig46 {
-				s = append([]netip.AddrPort{origipp46}, s...)
-			} else {
-				s = append([]netip.AddrPort{origipp}, s...)
-			}
+			s = append([]netip.AddrPort{origipp}, s...)
 		}
 		return s
 	}
-
-	if useOrig46 {
-		return []netip.AddrPort{origipp46}
-	}
 	return []netip.AddrPort{origipp}
-}
-
-func ipok(v netip.Addr) bool {
-	return v.IsValid() && !v.IsUnspecified()
 }
 
 // algip may or may not be an actual alg ip.
 // returned realips may be incoming algip itself or translated from algip,
 // depending on whether alg is enabled (ref: undidAlg).
-func (h *baseHandler) undoAlg(maybeAlg netip.Addr, uid string) (undidAlg bool, realips, domains, probableDomains, blocklists string) {
+func (h *baseHandler) undoAlg(algip netip.Addr, uid string) (undidAlg bool, realips, domains, probableDomains, blocklists string) {
 	const forcePTR = true // force PTR (realip => algans) translation?
 	anyTransport := dnsx.NoDNS
 	r := h.resolver
 	gw := r.Gateway()
 
-	ipok := ipok(maybeAlg)
+	ipok := !algip.IsUnspecified() && algip.IsValid()
 	didForce := false
 	hasreal := false
 	if ipok && gw != nil {
-		domains, didForce = gw.PTR(maybeAlg, uid, anyTransport, !forcePTR) // does NAT (algip => algans) translation
+		domains, didForce = gw.PTR(algip, uid, anyTransport, !forcePTR) // does NAT (algip => algans) translation
 		if !didForce && len(domains) <= 0 {
-			probableDomains, _ = gw.PTR(maybeAlg, uid, anyTransport, forcePTR)
+			probableDomains, _ = gw.PTR(algip, uid, anyTransport, forcePTR)
 		}
 		var ips []netip.Addr
 		// ips will contain the incoming "algip" arg, in cases where alg is NOT enabled.
-		ips, undidAlg = gw.X(maybeAlg, uid)
+		ips, undidAlg = gw.X(algip, uid)
 		realips = dnsx.Netip2Csv(ips)
 		hasreal = len(realips) > 0
-		blocklists = gw.RDNSBL(maybeAlg)
+		blocklists = gw.RDNSBL(algip)
 	}
 	// pick up corresponding domains from dialer's ipmap cache if none from gw.PTR
 	if ipok && len(domains) <= 0 && len(probableDomains) <= 0 {
-		if hosts := dialers.Ptr(maybeAlg); len(hosts) > 0 {
+		if hosts := dialers.Ptr(algip); len(hosts) > 0 {
 			probableDomains = strings.Join(hosts, ",")
 		}
 		if uid == SELF_UID {
@@ -738,33 +585,22 @@ func (h *baseHandler) undoAlg(maybeAlg netip.Addr, uid string) (undidAlg bool, r
 	}
 
 	logwif(!hasreal)("com: %s: alg: undoAlg: for [%s] (gw? %t ok? %t, force? %t, withForce? %t) %s => %v (for %s + %s / block: %s)",
-		h.proto, uid, gw != nil, undidAlg, didForce, forcePTR, maybeAlg, realips, domains, probableDomains, blocklists)
+		h.proto, uid, gw != nil, undidAlg, didForce, forcePTR, algip, realips, domains, probableDomains, blocklists)
 	return
 }
 
-// filterFamilyForDialingWithFailSafe filters out invalid IPs and IPs that are not
-// of the family that the dialer is configured to use, and includes one excluded IP as a fail-safe if needed.
-func (h *baseHandler) filterFamilyForDialingWithFailSafe(ipcsv string) (included []netip.Addr, excluded []netip.Addr, excludedIsIncluded bool) {
-	included, excluded, excludedIsIncluded = filterFamilyForDialing(h.resolver, ipcsv)
-	if !excludedIsIncluded && len(excluded) > 0 && len(included) > 0 {
-		ptmode := settings.PtMode.Load()
-		if ptmode == settings.PtModeForce || ptmode == settings.PtModeForce46 {
-			// when PtMode forces protocol translation, include up to len(included)
-			// excluded IPs so that both families are available for Happy Eyeballs
-			n := min(len(included), len(excluded))
-			included = append(included, excluded[:n]...)
-			excluded = nil
-		} else {
-			// if not falling back, then include one excluded ip as a fail-safe
-			included = append(included, core.ChooseOne(excluded))
-		}
+func filterFamilyForDialingWithFailSafe(ipcsv string) (included []netip.Addr, excluded []netip.Addr, excludedIsIncluded bool) {
+	included, excluded, excludedIsIncluded = filterFamilyForDialing(ipcsv)
+	if (!excludedIsIncluded || len(excluded) > 0) && len(included) > 0 {
+		// if not falling back, then include one excluded ip as a fail-safe
+		included = append(included, core.ChooseOne(excluded))
 	}
 	return included, excluded, excludedIsIncluded
 }
 
 // filterFamilyForDialing filters out invalid IPs and IPs that are not
 // of the family that the dialer is configured to use.
-func filterFamilyForDialing(r dnsx.Resolver, ipcsv string) (included []netip.Addr, excluded []netip.Addr, excludedIsIncluded bool) {
+func filterFamilyForDialing(ipcsv string) (included []netip.Addr, excluded []netip.Addr, excludedIsIncluded bool) {
 	if len(ipcsv) <= 0 {
 		return
 	}
@@ -773,8 +609,6 @@ func filterFamilyForDialing(r dnsx.Resolver, ipcsv string) (included []netip.Add
 	// any of the 4to6 mechanisms like 464Xlat, DNS64/NAT64, Teredo etc.
 	use4 := dialers.Use4()
 	use6 := dialers.Use6()
-	has4 := false // filtered has v4?
-	has6 := false // filtered has v6?
 	invalids := 0
 	var filtered, unfiltered []netip.Addr
 	for _, ip := range ips {
@@ -782,39 +616,24 @@ func filterFamilyForDialing(r dnsx.Resolver, ipcsv string) (included []netip.Add
 			invalids++
 			continue
 		}
-		if use4 && ip.Is4() {
+		// TODO: always include unspecified IPs as it is used by the client to make block/no-block decisions?
+		// The above is not true anymore?
+		if use4 && ip.Is4() || use6 && ip.Is6() {
 			filtered = append(filtered, ip)
-			has4 = true
-		} else if use6 && ip.Is6() {
-			filtered = append(filtered, ip)
-			has6 = true
-		} else if ipok(ip) {
-			// TODO: always include unspecified IPs as it is used by the client to make block/no-block decisions?
-			// The above is not true anymore?
+		} else if ip.IsValid() && !ip.IsUnspecified() {
 			unfiltered = append(unfiltered, ip)
 		}
 	}
-	translated := true
-	cantranslate := settings.PtMode.Load() != settings.PtModeNone
-	if cantranslate && len(filtered) <= 0 && len(unfiltered) > 0 && !has6 {
-		// apply current dns64 prefix since there's no other v6 to dial
-		for _, ip := range ips {
-			if ip.Is4() {
-				if v6 := r.X46(dnsx.System, ip); ipok(v6) {
-					unfiltered = append(unfiltered, v6)
-					translated = true
-				}
-			}
-		}
-	}
+	logger := log.VV
 	// fail open: if no ipv4 then fallback to ipv6, and vice-versa.
 	if len(filtered) <= 0 {
 		excludedIsIncluded = true
 		filtered = unfiltered
 		unfiltered = nil
+		logger = log.W
 	}
-	logwif(len(filtered) <= 0)("com: filterFamily(v4? %t / has4? %t, v6? %t / has6? %t, x? %t, fallback? %t): filtered: %d/%d; in: %v, out: %v, ignored: %v + %d",
-		use4, has4, use6, has6, translated, excludedIsIncluded, len(filtered), len(ips), ips, filtered, unfiltered, invalids)
+	logger("com: filterFamily(v4? %t, v6? %t, fallback? %t): filtered: %d/%d; in: %v, out: %v, ignored: %v + %d",
+		use4, use6, excludedIsIncluded, len(filtered), len(ips), ips, filtered, unfiltered, invalids)
 	return filtered, unfiltered, excludedIsIncluded
 }
 
@@ -826,7 +645,7 @@ func (h *baseHandler) judge(decision *Mark, aux ...string) (cid, uid, fid string
 	}
 
 	if len(decision.UID) > 0 {
-		uid = decision.UID // may be SELF_UID or UNKNOWN_UID_STR
+		uid = decision.UID
 	} else {
 		uid = UNKNOWN_UID_STR
 	}
@@ -835,11 +654,11 @@ func (h *baseHandler) judge(decision *Mark, aux ...string) (cid, uid, fid string
 
 	if len(decision.PIDCSV) > 0 {
 		for v := range strings.SplitSeq(decision.PIDCSV, ",") {
-			v = strings.TrimSpace(v)
 			if v == ipn.Block { // block overrides all other pids
 				pids = []string{ipn.Block}
 				return
 			}
+			v = strings.TrimSpace(v)
 			if len(v) > 0 {
 				pids = append(pids, v)
 			}
@@ -849,22 +668,17 @@ func (h *baseHandler) judge(decision *Mark, aux ...string) (cid, uid, fid string
 	return
 }
 
-// maybeReplaceDest replaces the target AddrPort with the IP in res, if res.IP is set and valid.
 func (h *baseHandler) maybeReplaceDest(res *Mark, target *netip.AddrPort) {
 	if len(res.IP) <= 0 {
 		return
 	} else if resip, err := netip.ParseAddr(res.IP); resip.IsValid() && err == nil {
 		// if res.IP is set, then use it as the target
-		if log.Debug {
+		if settings.Debug {
 			log.D("%s: proxy: %s %s target instead of %s",
 				h.proto, res.CID, resip, target)
 		}
 		*target = netip.AddrPortFrom(resip, target.Port())
 	}
-}
-
-func (h *baseHandler) flowing(smm *FlowSummary) {
-	h.listener.Flowing(smm.postMark())
 }
 
 func conn2str(a net.Conn, b net.Conn) string {
@@ -882,7 +696,6 @@ func clos(c ...core.MinConn) {
 	core.CloseConn(c...)
 }
 
-// ntoa returns the IP protocol number for the given network string.
 func ntoa(n string) int32 {
 	switch n {
 	case "udp", "udp6", "udp4":
@@ -907,11 +720,6 @@ func isAnyBasePid(pids []string) bool {
 
 func containsPid(pids []string, pid string) bool {
 	return slices.Contains(pids, pid)
-}
-
-// TODO: loop tracker key must account for proto:ip:port not just proto:ip
-func looptrackerKey(smm *FlowSummary) string {
-	return smm.Proto + ":" + smm.Target
 }
 
 func extendc(c net.Conn, r time.Duration, w time.Duration) {
@@ -993,5 +801,5 @@ func pidstr(p ipn.Proxy) string {
 	if p == nil {
 		return ""
 	}
-	return p.ID()
+	return p.ID().V()
 }

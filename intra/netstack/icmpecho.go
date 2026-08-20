@@ -24,7 +24,7 @@ const minICMPPacketSize = header.ICMPv4MinimumSize + header.IPv4MinimumSize
 // TODO: get rid of the global in favor of passing the handler via the responder.
 // hdlEcho stores the ICMP handler used by the dispatcher-level ICMP
 // interception path.
-var hdlEcho atomic.Pointer[icmpForwarder]
+var hdlEcho = core.NewZeroVolatile[*icmpForwarder]()
 
 func setICMPEchoHandler(h *icmpForwarder) {
 	hdlEcho.Store(h)
@@ -54,9 +54,9 @@ func newICMPResponder(ep stack.LinkEndpoint) (r icmpResponder) {
 	return
 }
 
-// returns true if the responder is enabled.
+// returns true if the responder is enabled and debug mode is on.
 func (r *icmpResponder) ok() bool {
-	return r != nil && r.open.Load()
+	return settings.Debug && r != nil && r.open.Load()
 }
 
 func (r *icmpResponder) respond(pkt *stack.PacketBuffer) (handled bool) {
@@ -92,13 +92,12 @@ func (r *icmpResponder) handle(h *icmpForwarder, nic tcpip.NICID, pkt *stack.Pac
 
 	v := c.ToView()
 	b := v.ToSlice()
-	v.Release() // ToSlice returns an owned copy; release the view's chunk ref immediately
 	n := len(b)
 
 	notok := n <= 0 || h == nil
 	if settings.Debug || notok {
-		logwv(notok)("icmp: responder: read to writer (sz: %d / %d); h? %t / fwd? %t",
-			n, inSize, h != nil, useIcmpForwarder)
+		logwv(notok)("icmp: responder: read to writer (sz: %d / %d / %d); h? %t / fwd? %t",
+			n, v.Size(), inSize, h != nil, useIcmpForwarder)
 	}
 	if notok {
 		return
@@ -140,23 +139,14 @@ func (r *icmpResponder) handle(h *icmpForwarder, nic tcpip.NICID, pkt *stack.Pac
 	}
 
 	if useIcmpForwarder {
-		if icmpForward(h, pkt, src, dst) {
-			// The forwarder answered (or will answer asynchronously via
-			// netstack's route); the parsed packet is no longer needed.
-			wire.Pool.Put(parsed)
-			return true
-		}
-		// fallback to process(), which answers the ping
-		// directly to the TUN without needing a route.
-		if log.Debug {
-			log.W("icmp: responder: icmpforwarder err; direct reply for %s => %s", src, dst)
-		}
+		wire.Pool.Put(parsed)
+		return icmpForward(h, pkt, src, dst)
+	} else {
+		// Process asynchronously to avoid blocking the dispatcher loop.
+		core.Gx("icmp.responder", func() {
+			r.process(h, nic, parsed, src, dst)
+		})
 	}
-
-	// async to avoid blocking the dispatcher loop.
-	core.Gx("icmp.responder", func() {
-		r.process(h, nic, parsed, src, dst)
-	})
 
 	return true
 }

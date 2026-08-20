@@ -11,22 +11,28 @@ import (
 	"testing"
 
 	x "github.com/celzero/firestack/intra/backend"
-	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/dialers"
 	"github.com/celzero/firestack/intra/protect"
 	"github.com/celzero/firestack/intra/protect/ipmap"
-	"github.com/miekg/dns"
 )
 
 type fakeProxy struct{ id string }
 
 type systemMapper struct{}
 
-func (systemMapper) Lookup(_ *dns.Msg, _ string, _ ...string) (*dns.Msg, error) {
+func (systemMapper) Lookup(_ []byte, _ ...string) ([]byte, error) {
 	return nil, errors.New("wire lookup not supported")
 }
-
-func (systemMapper) LookupNetIP(ctx context.Context, network, host, _ string, _ ...string) ([]netip.Addr, error) {
+func (systemMapper) LookupFor(_ []byte, _ string) ([]byte, error) {
+	return nil, errors.New("wire lookup not supported")
+}
+func (systemMapper) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, network, host)
+}
+func (systemMapper) LookupNetIPFor(ctx context.Context, network, host, _ string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, network, host)
+}
+func (systemMapper) LookupNetIPOn(ctx context.Context, network, host string, _ ...string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, network, host)
 }
 
@@ -47,19 +53,18 @@ func (f *fakeProxy) Probe(string, string) (protect.PacketConn, error) {
 	return nil, errProbeNotSupported
 }
 func (f *fakeProxy) Dialer() protect.RDialer                { return f }
-func (f *fakeProxy) DialerHandle() uint64                   { return core.Nobody }
-func (f *fakeProxy) Handle() uint64                         { return core.Nobody }
-func (f *fakeProxy) ID() string                             { return f.id }
-func (f *fakeProxy) Type() string                           { return NOOP }
+func (f *fakeProxy) DialerHandle() uintptr                  { return 0 }
+func (f *fakeProxy) Handle() uintptr                        { return 0 }
+func (f *fakeProxy) ID() *x.Gostr                           { return x.StrOf(f.id) }
+func (f *fakeProxy) Type() *x.Gostr                         { return x.StrOf(NOOP) }
 func (f *fakeProxy) Router() x.Router                       { return &GWNoVia{} }
 func (f *fakeProxy) Client() x.Client                       { return newProxyClient(f) }
 func (f *fakeProxy) onNotOK() (bool, bool)                  { return false, true }
 func (f *fakeProxy) OnProtoChange(LinkProps) (string, bool) { return "", false }
-func (f *fakeProxy) Hop(*core.WeakRef[Proxy], bool) error   { return nil }
-func (f *fakeProxy) Status() int32                          { return TOK }
-func (f *fakeProxy) GetAddr() string                        { return "" }
-func (f *fakeProxy) setSince(int64)                         {}
-func (f *fakeProxy) DNS() string                            { return "" }
+func (f *fakeProxy) Hop(Proxy, bool) error                  { return nil }
+func (f *fakeProxy) Status() int                            { return TOK }
+func (f *fakeProxy) GetAddr() *x.Gostr                      { return x.StrOf("") }
+func (f *fakeProxy) DNS() *x.Gostr                          { return x.StrOf("") }
 func (f *fakeProxy) Ping() bool                             { return true }
 func (f *fakeProxy) Pause() bool                            { return false }
 func (f *fakeProxy) Resume() bool                           { return false }
@@ -67,17 +72,11 @@ func (f *fakeProxy) Stop() error                            { return nil }
 func (f *fakeProxy) Refresh() error                         { return nil }
 
 func restoreDefaultURLs(t *testing.T) func() {
-	prevWs := wsGeoURL
-	prevIPinfo := ipinfoURL
 	prevTrace, prevWarp := traceURL, warpURL
 	prevV4, prevV6 := mullvadV4URL, mullvadV6URL
-	wsGeoURL = defaultWsGeoURL
-	ipinfoURL = defaultIPinfoURL
 	traceURL, warpURL = defaultTraceURL, defaultWarpURL
 	mullvadV4URL, mullvadV6URL = defaultMullvadV4URL, defaultMullvadV6URL
 	return func() {
-		wsGeoURL = prevWs
-		ipinfoURL = prevIPinfo
 		traceURL, warpURL = prevTrace, prevWarp
 		mullvadV4URL, mullvadV6URL = prevV4, prevV6
 	}
@@ -107,14 +106,6 @@ func newServerWithListener(t *testing.T, ln net.Listener) *httptest.Server {
 	handler.HandleFunc("/cdn-cgi/trace", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("fl=765f119\nloc=US\ncolo=DFW\nip=1.2.3.4\n"))
 	})
-	handler.HandleFunc("/GeoGreet", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"data":{"geo":{"ip":"1.2.3.4","country_code":"US","city_name":"Dallas","isp":"Example Org","lat":"32.8","long":"-96.8"}},"errorCode":0}`))
-	})
-	handler.HandleFunc("/ip", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ip":"1.2.3.4","asn":"AS55824","as_name":"NKN Core Network","as_domain":"nkn.gov.in","country_code":"IN","country":"India","continent_code":"AS","continent":"Asia"}`))
-	})
 	handler.HandleFunc("/json", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ip":"1.2.3.4","country":"United States","city":"Dallas","longitude":-96.8,"latitude":32.8,"organization":"Example Org"}`))
@@ -127,85 +118,12 @@ func newServerWithListener(t *testing.T, ln net.Listener) *httptest.Server {
 	return srv
 }
 
-func TestProxyClientWindscribe(t *testing.T) {
-	srv := newIPv4Server(t)
-
-	prevWs := wsGeoURL
-	wsGeoURL = srv.URL + "/GeoGreet"
-	defer func() { wsGeoURL = prevWs }()
-
-	p := &fakeProxy{id: "test-ws"}
-	meta, err := newProxyClient(p).IP4()
-	if err != nil {
-		t.Fatalf("windscribe err: %v", err)
-	}
-	if meta.IP != "1.2.3.4" {
-		t.Fatalf("ip mismatch: %v", meta.IP)
-	}
-	if meta.CC != "US" {
-		t.Fatalf("cc mismatch: %v", meta.CC)
-	}
-	if meta.City != "Dallas" {
-		t.Fatalf("city mismatch: %v", meta.City)
-	}
-	if meta.ASNOrg != "Example Org" {
-		t.Fatalf("asn org mismatch: %v", meta.ASNOrg)
-	}
-	if meta.ProviderURL != wsGeoURL {
-		t.Fatalf("provider mismatch: %v", meta.ProviderURL)
-	}
-}
-
-func TestProxyClientIPinfo(t *testing.T) {
-	srv := newIPv4Server(t)
-
-	prevIPinfo := ipinfoURL
-	ipinfoURL = srv.URL + "/ip"
-	skipWsForTesting = true
-	defer func() {
-		skipWsForTesting = false
-		ipinfoURL = prevIPinfo
-	}()
-
-	p := &fakeProxy{id: "test-ipinfo"}
-	meta, err := newProxyClient(p).IP4()
-	if err != nil {
-		t.Fatalf("ipinfo err: %v", err)
-	}
-	if meta.IP != "1.2.3.4" {
-		t.Fatalf("ip mismatch: %v", meta.IP)
-	}
-	if meta.CC != "IN" {
-		t.Fatalf("cc mismatch: %v", meta.CC)
-	}
-	if meta.ASN != "AS55824" {
-		t.Fatalf("asn mismatch: %v", meta.ASN)
-	}
-	if meta.ASNOrg != "NKN Core Network" {
-		t.Fatalf("asn org mismatch: %v", meta.ASNOrg)
-	}
-	if meta.ASNDom != "nkn.gov.in" {
-		t.Fatalf("asn dom mismatch: %v", meta.ASNDom)
-	}
-	if meta.ProviderURL != ipinfoURL {
-		t.Fatalf("provider mismatch: %v", meta.ProviderURL)
-	}
-}
-
 func TestProxyClientIP4(t *testing.T) {
 	srv := newIPv4Server(t)
 
-	prevWs, prevIPinfo, prevTrace, prevMull := wsGeoURL, ipinfoURL, traceURL, mullvadV4URL
-	skipWsForTesting = true
-	skipIPinfoForTesting = true
-	skipTraceForTesting = true
-	wsGeoURL, ipinfoURL, traceURL, mullvadV4URL = srv.URL+"/GeoGreet", srv.URL+"/ip", srv.URL+"/cdn-cgi/trace", srv.URL+"/json"
-	defer func() {
-		skipWsForTesting = false
-		skipIPinfoForTesting = false
-		skipTraceForTesting = false
-		wsGeoURL, ipinfoURL, traceURL, mullvadV4URL = prevWs, prevIPinfo, prevTrace, prevMull
-	}()
+	prevTrace, prevMull := traceURL, mullvadV4URL
+	traceURL, mullvadV4URL = srv.URL+"/cdn-cgi/trace", srv.URL+"/json"
+	defer func() { traceURL, mullvadV4URL = prevTrace, prevMull }()
 
 	p := &fakeProxy{id: "test-ipv4"}
 	meta, err := newProxyClient(p).IP4()
@@ -217,8 +135,7 @@ func TestProxyClientIP4(t *testing.T) {
 		t.Fatalf("ip mismatch: %v", meta.IP)
 	}
 	if meta.CC != "US" {
-		// TODO: For mullvadV4URL, short country code isn't in the response
-		// t.Fatalf("cc mismatch: %v", meta.CC)
+		t.Fatalf("cc mismatch: %v", meta.CC)
 	}
 	if meta.City != "Dallas" {
 		t.Fatalf("city mismatch: %v", meta.City)
@@ -237,17 +154,9 @@ func TestProxyClientIP6(t *testing.T) {
 		t.Skip("ipv6 not available")
 	}
 
-	prevWs, prevIPinfo, prevTrace, prevMull := wsGeoURL, ipinfoURL, traceURL, mullvadV6URL
-	skipWsForTesting = true
-	skipIPinfoForTesting = true
-	skipTraceForTesting = true
-	wsGeoURL, ipinfoURL, traceURL, mullvadV6URL = srv.URL+"/GeoGreet", srv.URL+"/ip", srv.URL+"/cdn-cgi/trace", srv.URL+"/json"
-	defer func() {
-		skipWsForTesting = false
-		skipIPinfoForTesting = false
-		skipTraceForTesting = false
-		wsGeoURL, ipinfoURL, traceURL, mullvadV6URL = prevWs, prevIPinfo, prevTrace, prevMull
-	}()
+	prevTrace, prevMull := traceURL, mullvadV6URL
+	traceURL, mullvadV6URL = srv.URL+"/cdn-cgi/trace", srv.URL+"/json"
+	defer func() { traceURL, mullvadV6URL = prevTrace, prevMull }()
 
 	p := &fakeProxy{id: "test-ipv6"}
 	meta, err := newProxyClient(p).IP6()
@@ -259,8 +168,7 @@ func TestProxyClientIP6(t *testing.T) {
 		t.Fatalf("ip mismatch: %v", meta.IP)
 	}
 	if meta.CC != "US" {
-		// TODO: For mullvadV6URL, short country code isn't in the response
-		// t.Fatalf("cc mismatch: %v", meta.CC)
+		t.Fatalf("cc mismatch: %v", meta.CC)
 	}
 	if meta.ProviderURL != mullvadV6URL {
 		t.Fatalf("provider mismatch: %v", meta.ProviderURL)
@@ -269,10 +177,9 @@ func TestProxyClientIP6(t *testing.T) {
 
 func TestProxyClientIP4Live(t *testing.T) {
 	defer restoreDefaultURLs(t)()
-	skipWsForTesting = false
 	skipWarpForTesting = true
 	skipTraceForTesting = true
-	skipMullvadForTesting = true
+	skipMullvadForTesting = false
 	dialers.Mapper(ipmap.NewIPMapFor(systemMapper{}))
 
 	p := &fakeProxy{id: "live-ipv4"}
@@ -280,7 +187,6 @@ func TestProxyClientIP4Live(t *testing.T) {
 	if err != nil {
 		t.Fatalf("live ip4 err: %v", err)
 	}
-	t.Log(meta)
 
 	if meta.IP == "" {
 		t.Fatal("live ip4: empty ip")
@@ -298,7 +204,6 @@ func TestProxyClientIP4Live(t *testing.T) {
 
 func TestProxyClientIP6Live(t *testing.T) {
 	defer restoreDefaultURLs(t)()
-	skipWsForTesting = true
 	skipWarpForTesting = false
 	skipTraceForTesting = true
 	skipMullvadForTesting = true

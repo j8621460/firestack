@@ -29,17 +29,16 @@ jobs:
       publish: ${{ steps.post-build.outputs.publish }}
     env:
       FOUT: firestack.aar
-      FOUTSYM: firestack-debug-symbols.zip
-      DBGUNSTRIPPED: "build/intra/unstripped"
+      FOUTDBG: firestack-debug.aar
 
     steps:
     - name: 🥏 Checkout code
       uses: actions/checkout@v6
 
-    - name: 🐼 Setup Go
+    - name: 🐼 Setup go1.26+
       uses: actions/setup-go@v6
       with:
-        go-version-file: 'go.mod'
+        go-version: '>=1.26'
         check-latest: true
 
     - name: 🏗️ Make
@@ -50,7 +49,7 @@ jobs:
         # GET triggers a build; api: docs.jitpack.io/api/#builds
         curl https://jitpack.io/api/builds/com.github.celzero/firestack/${VCSVER} | jq || true
 
-        # outputs firestack.aar (stripped) + firestack-debug-symbols.zip; also see: "Obj" below
+        # outputs firestack.aar and firestack-debug.aar; also see: "Obj" below
         ./make-aar nogo debug
       shell: bash
 
@@ -72,8 +71,8 @@ jobs:
         name: firestack-aar-${{ github.sha }} # must be unique
         path: |
           firestack.aar
-          firestack-sources.jar
-          firestack-debug-symbols.zip
+          firestack-debug.aar
+          build/intra/tun2socks-sources.jar
         retention-days: 52 # 0-90; 90 is max
         if-no-files-found: error # error, warn (default), ignore
         compression-level: 9 # 0-9; 9 is max
@@ -104,20 +103,18 @@ jobs:
     - name: 📝 SBOM submission
       if: success()
       continue-on-error: true
-      uses: advanced-security/spdx-dependency-submission-action@v0.2.0
+      uses: advanced-security/spdx-dependency-submission-action@v0.1.1
       with:
         filePath: "_manifest/spdx_2.2/"
 
     - name: 💿 Obj
-      continue-on-error: true
       if: ${{ steps.make.outcome == 'success' }}
       run: |
-        wget --tries=2 --waitretry=3 --no-dns-cache https://github.com/Zxilly/go-size-analyzer/releases/download/v1.12.3/go-size-analyzer_1.12.3_linux_amd64v3.deb -O gsa.deb
-        echo "c77c542d149a9958c850b18619e99456ff4b5b88d9d2062b0d2df83cbca069dc  gsa.deb" | sha256sum -c -
+        wget --tries=2 --waitretry=3 --no-dns-cache https://github.com/Zxilly/go-size-analyzer/releases/download/v1.0.8/go-size-analyzer_1.0.8_linux_amd64.deb -O gsa.deb
         sudo dpkg -i gsa.deb
-        # tun2socks*.aar/firestack*.aar; see: make-aar
+        # s/tun2socks*.aar/firestack*.aar; see: make-aar
         #
-        # Archive:  firestack.aar
+        # Archive:  firestack-debug.aar
         # inflating: AndroidManifest.xml
         # inflating: proguard.txt
         # inflating: classes.jar
@@ -128,43 +125,9 @@ jobs:
         # inflating: R.txt
         # creating: res/
         # /usr/bin/jar
-        unzip ${FOUT}
+        unzip firestack-debug.aar
         which jar && jar tf ./classes.jar
-
-        # stripped from FOUT
-        stripped="jni/arm64-v8a/libgojni.so"
-        # eu-unstrip: merge debug-only SOs (from FOUTSYM) back into the stripped SOs
-        sudo apt-get install -y --no-install-recommends elfutils
-        unzip -q "${FOUTSYM}" -d debugsyms
-
-        debug="debugsyms/jni/arm64-v8a/libgojni.so"
-        if [ -f "$stripped" ] && [ -f "$debug" ]; then
-          eu-unstrip "$stripped" "$debug" -o "$stripped"
-          echo "restored symbols: arm64-v8a/libgojni.so:"
-          ls -ltr "$stripped" && readelf -s "$stripped" | head -20
-        fi
-
-        readelf -l jni/arm64-v8a/*.so
-        # check for NT_GNU_BUILD_ID
-        readelf -n jni/arm64-v8a/*.so
-
-        # gsa jni/arm64-v8a/*.so -f text --verbose
-
-        # The unstripped original at $DBGUNSTRIPPED has a Go buildid note of
-        # the form "Android/<hash>" because gomobile links against the Android
-        # runtime; gsa (via gore/ZxillyFork) parses this as GoVersion="Android"
-        # and aborts with `could not parse the go version Android`. Strip the
-        # note so gsa falls back to scanning .rodata for (runtime.buildVersion
-        # string is always present, even on Android).
-        og="${DBGUNSTRIPPED}/jni/arm64-v8a/libgojni.so"
-        if [ -f "$og" ]; then
-          echo "=== gsa: orig arm64-v8a (buildid note stripped) ==="
-          cp "$og" "$og.gsa"
-          objcopy --remove-section=.note.go.buildid "$og.gsa" 2>/dev/null || true
-          gsa "$og.gsa" -f text --verbose
-        else
-          echo "::warning::not found $og"
-        fi
+        gsa jni/arm64-v8a/*.so -f text --verbose
 
         #pip install sqlelf
 
@@ -188,6 +151,7 @@ jobs:
         #  WHERE tag = 'DW_TAG_subprogram'
         #  ORDER BY function_size DESC
         #  LIMIT 50;"
+        readelf -l jni/arm64-v8a/*.so
 
         # from: cs.android.com/android/platform/superproject/main/+/main:system/extras/tools/check_elf_alignment.sh;drc=97bcb31779;l=87
         RED="\e[31m"
@@ -229,7 +193,6 @@ jobs:
         # github.com/actions/setup-go/issues/27
         export PATH=${PATH}:`go env GOPATH`/bin
 
-        # ref: go.dev/blog/gofix
         # vet: fails: archive.is/XcDl6
         go vet ./...
 
@@ -278,7 +241,7 @@ jobs:
       run: |
         # grype output
         if [[ -n "${GRYPE_SARIF}" && -f "${GRYPE_SARIF}" ]]; then
-          ls -Rltr "${GRYPE_SARIF}"
+          ls -ltr "${GRYPE_SARIF}"
         else
           echo "::notice::Grype report missing"
         fi
@@ -287,7 +250,7 @@ jobs:
         VCSVER="${GITHUB_SHA:0:10}"
 
         subjects='[]'
-        for key in FOUT; do
+        for key in FOUT FOUTDBG; do
           artifact="${!key}"
           if [ ! -f "$artifact" ]; then
             echo "::error::missing artifact ${artifact}"
@@ -397,8 +360,6 @@ jobs:
       - name: ⚖️ Licenses
         continue-on-error: true
         run: |
-          # github.com/actions/setup-go/issues/27
-          export PATH=${PATH}:`go env GOPATH`/bin
           # installing osv-scanner is ... expensive
           # github.com/google/osv-scanner/blob/main/README.md
           if ! command -v osv-scanner >/dev/null 2>&1; then
@@ -443,7 +404,7 @@ jobs:
       - name: 🥏 Checkout
         uses: actions/checkout@v6
       - name: 🍭 Run
-        uses: oss-review-toolkit/ort-ci-github-action@v1.2.0
+        uses: oss-review-toolkit/ort-ci-github-action@main
         with:
           run: >
             cache-dependencies,
@@ -493,7 +454,7 @@ jobs:
       - name: 🐼 Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: 'go.mod'
+          go-version: '>=1.26'
           cache: false
       # github.com/tailscale/tailscale/blob/93324cc7b/.github/workflows/depaware.yml
       # consolidated in: github.com/tailscale/tailscale/commit/4022796484

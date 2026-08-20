@@ -76,7 +76,7 @@ func Sort[T any](arr []T, less func(a, b T) int) []T {
 }
 
 func Map[T, U any](arr []T, transform func(T) U) (out []U) {
-	out = make([]U, 0, len(arr))
+	out = make([]U, 0)
 	for _, x := range arr {
 		out = append(out, transform(x))
 	}

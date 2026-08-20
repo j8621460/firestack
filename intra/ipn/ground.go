@@ -17,11 +17,10 @@ type ground struct {
 	NoDNS
 	ProtoAgnostic
 	SkipRefresh
+	GWNoVia
 	CantPause
 	NoClient
-	*GWNoVia
 	addr string
-	hdl  uint64
 }
 
 var _ Proxy = (*ground)(nil)
@@ -32,18 +31,16 @@ func NewGroundProxy() *ground {
 		GWNoVia: ProxyNoGateway,
 		addr:    "[::]:0",
 	}
-	h.since.Store(now())
-	h.hdl = core.Loc(h)
 	return h
 }
 
 // Handle implements Proxy.
-func (h *ground) Handle() uint64 {
-	return h.hdl
+func (h *ground) Handle() uintptr {
+	return core.Loc(h)
 }
 
 // DialerHandle implements Proxy.
-func (h *ground) DialerHandle() uint64 {
+func (h *ground) DialerHandle() uintptr {
 	return h.Handle()
 }
 
@@ -76,23 +73,23 @@ func (h *ground) Dialer() protect.RDialer {
 	return h // no-op dialer
 }
 
-func (h *ground) ID() string {
-	return Block
+func (h *ground) ID() *x.Gostr {
+	return x.StrOf(Block)
 }
 
-func (h *ground) Type() string {
-	return NOOP
+func (h *ground) Type() *x.Gostr {
+	return x.StrOf(NOOP)
 }
 
 func (h *ground) Router() x.Router {
 	return h
 }
 
-func (h *ground) GetAddr() string {
-	return h.addr
+func (h *ground) GetAddr() *x.Gostr {
+	return x.StrOf(h.addr)
 }
 
-func (h *ground) Status() int32 {
+func (h *ground) Status() int {
 	return TKO
 }
 

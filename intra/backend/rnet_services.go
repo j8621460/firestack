@@ -21,13 +21,13 @@ const (
 	// status of proxies
 
 	// svc UP
-	SUP int32 = 0
+	SUP = 0
 	// svc OK
-	SOK int32 = 1
+	SOK = 1
 	// svc not OK
-	SKO int32 = -1
+	SKO = -1
 	// svc stopped
-	SOP int32 = -2
+	SOP = -2
 )
 
 type Server interface {
@@ -42,7 +42,7 @@ type Server interface {
 	// Addr returns the address of the server.
 	GetAddr() string
 	// Status returns the status of the server.
-	Status() int32
+	Status() int
 	// Stop stops the server.
 	Stop() error
 	// Refresh re-registers the server.

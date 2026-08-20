@@ -10,13 +10,10 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unique"
-	"weak"
 
 	"slices"
 
@@ -56,57 +53,24 @@ type connstat struct {
 }
 
 type cm struct {
-	id string // identifier; used in metrics
 	sync.RWMutex
 	tracc map[string]connstat // cid -> conns
 	tracp map[string][]string // pid -> cid
 	tracu map[string][]string // uid -> cid
 	sz    int
-
-	ntracks   atomic.Uint64 // count of Track() calls
-	nuntracks atomic.Uint64 // count of Untrack() calls
-	ngets     atomic.Uint64 // count of Get() / GetAll() calls
 }
 
 var _ ConnMapper = (*cm)(nil)
 
-func NewConnMap(id string) *cm {
-	m := &cm{
-		id:    id,
+func NewConnMap() *cm {
+	return &cm{
 		tracc: make(map[string]connstat),
 		tracp: make(map[string][]string),
 		tracu: make(map[string][]string),
 	}
-	m.id = m.id + "." + LocStr(m)
-	id = m.id
-	wm := weak.Make(m)
-	deregister := trackmap(m.id, func() MapState {
-		if p := wm.Value(); p != nil {
-			return p.Stat()
-		}
-		return MapState{Typ: "connmap", ID: "gc." + id}
-	})
-	runtime.AddCleanup(m, func(f func()) { f() }, deregister)
-	return m
-}
-
-// Stat returns a snapshot of the map's current state.
-func (h *cm) Stat() MapState {
-	h.RLock()
-	l := h.sz
-	h.RUnlock()
-	return MapState{
-		ID:   h.id,
-		Typ:  "connmap",
-		Len:  uint64(l),
-		Puts: h.ntracks.Load(),
-		Gets: h.ngets.Load(),
-		Dels: h.nuntracks.Load(),
-	}
 }
 
 func (h *cm) Track(cid, uid, pid string, conns ...MinConn) (n int) {
-	h.ntracks.Add(1)
 	h.Lock()
 	defer h.Unlock()
 
@@ -117,7 +81,6 @@ func (h *cm) Track(cid, uid, pid string, conns ...MinConn) (n int) {
 }
 
 func (h *cm) Untrack(cid string) (n int) {
-	h.nuntracks.Add(1)
 	h.Lock()
 	defer h.Unlock()
 
@@ -190,14 +153,9 @@ func (h *cm) delLocked(id string) (n int) {
 		h.sz -= n
 		// id maybe pid or uid
 	} else if cidsByUid := h.getByUidLocked(id); len(cidsByUid) > 0 {
-		// untrackBatchLocked calls delLocked per cid, which calls
-		// delByUidLocked => slices.Delete on the same backing array we are
-		// about to iterate; the in-place shift zeroes the tail and the range
-		// loop skips entries (e.g. [c1,c2,c3] => delete c1 => [c2,c3,""],
-		// loop reads index 1 = "c3", never sees "c2").
-		return len(h.untrackBatchLocked(slices.Clone(cidsByUid)))
+		return len(h.untrackBatchLocked(cidsByUid))
 	} else if cidsByPid := h.getByPidLocked(id); len(cidsByPid) > 0 {
-		return len(h.untrackBatchLocked(slices.Clone(cidsByPid)))
+		return len(h.untrackBatchLocked(cidsByPid))
 	} else {
 		log.VV("connmap: untrack: id not tracked %s", id)
 	}
@@ -243,10 +201,10 @@ func (h *cm) delByUidLocked(uid, cid string) (deleted []string) {
 		if id == cid {
 			deleted = append(deleted, id)
 			if rem := slices.Delete(cids, i, i+1); len(rem) <= 0 {
-				delete(h.tracu, uid)
+				delete(h.tracp, uid)
 				break
 			} else {
-				h.tracu[uid] = rem
+				h.tracp[uid] = rem
 			}
 		}
 	}
@@ -277,7 +235,6 @@ func (h *cm) untrackBatchLocked(cidsOrUidsOrPids []string) (out []string) {
 }
 
 func (h *cm) Get(cid string) (conns []MinConn) {
-	h.ngets.Add(1)
 	h.RLock()
 	defer h.RUnlock()
 
@@ -288,7 +245,6 @@ func (h *cm) Get(cid string) (conns []MinConn) {
 }
 
 func (h *cm) GetAll(uidOrPid string) (conns []MinConn) {
-	h.ngets.Add(1)
 	h.RLock()
 	defer h.RUnlock()
 
@@ -297,10 +253,7 @@ func (h *cm) GetAll(uidOrPid string) (conns []MinConn) {
 	}
 	cidsByPid := h.getByPidLocked(uidOrPid)
 	cidsByUid := h.getByUidLocked(uidOrPid)
-	// slices.Concat always allocates a new slice; using append(cidsByPid, cidsByUid...)
-	// would mutate the map-owned backing array when cidsByPid has spare capacity
-	// (left by slices.Delete), causing a data race between concurrent RLock readers.
-	for _, cid := range slices.Concat(cidsByPid, cidsByUid) {
+	for _, cid := range append(cidsByPid, cidsByUid...) {
 		if cs := h.getLocked(cid); cs != nil {
 			conns = append(conns, cs.c...)
 		}

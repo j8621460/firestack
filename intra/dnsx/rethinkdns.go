@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,7 +23,6 @@ import (
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/log"
-	"github.com/celzero/firestack/intra/protect/ipmap"
 	"github.com/celzero/firestack/intra/xdns"
 
 	"slices"
@@ -66,25 +64,20 @@ var (
 
 type RdnsResolver interface {
 	x.RDNSResolver
-	// IsDnsAddrPort returns true if the ip:port is resolver's fake endpoint
-	IsDnsAddrPort(ipport netip.AddrPort) bool
-	// IsDnsAddr returns true if the ip is resolver's fake endpoint
-	IsDnsAddr(ip netip.Addr) bool
-	// blockQ determines if a DNS query is blocked by chosen RethinkDNS blocklist.
 	blockQ(Transport, Transport, *dns.Msg) (*dns.Msg, string, error)
-	// blockA determines if a DNS answer is blocked by chosen RethinkDNS blocklist.
 	blockA(Transport, Transport, *dns.Msg, *dns.Msg, string) (*dns.Msg, string, string)
 }
 
 // ResolverSelf is for internal resolution needs.
 type ResolverSelf interface {
-	ipmap.IPMapper
-
-	// lookup performs resolution for uid, optionally on chosen transports.
-	// If tids are provided, resolution uses those transports directly.
-	// If no tids are provided, resolution uses preferences (and may fall back
-	// through Preferred/Fixed for system UIDs).
-	lookup(q *dns.Msg, uid string, tids ...string) (a *dns.Msg, tid string, err error)
+	// LocalLookup performs resolution on Default and/or Goos DNSes.
+	// To be only used by protect.UidSelf.
+	LocalLookup(q []byte) (a []byte, tid string, err error)
+	// Lookup performs resolution on chosen Transport.
+	// To be only used by protect.UidSelf.
+	Lookup(q []byte, chosen ...string) (a []byte, tid string, err error)
+	// LookupFor performs resolution for uid.
+	LookupFor(q []byte, uid string) (a []byte, tid string, err error)
 }
 
 type RDNS interface {
@@ -166,8 +159,8 @@ func (r *rethinkdns) OnDeviceBlock() bool {
 	return r.mode == localBlock
 }
 
-func (r *rethinkdns) GetStamp() (string, error) {
-	return r.getStamp()
+func (r *rethinkdns) GetStamp() (*x.Gostr, error) {
+	return x.StrOfFunc(r.getStamp)
 }
 
 func (r *rethinkdns) getStamp() (s string, err error) {
@@ -183,8 +176,8 @@ func (r *rethinkdns) getStamp() (s string, err error) {
 	return
 }
 
-func (r *rethinkdns) SetStamp(stamp string) error {
-	return r.setStamp(stamp)
+func (r *rethinkdns) SetStamp(stamp *x.Gostr) error {
+	return r.setStamp(stamp.V())
 }
 
 func (r *rethinkdns) setStamp(stamp string) error {
@@ -205,8 +198,8 @@ func (r *rethinkdns) setStamp(stamp string) error {
 }
 
 // Returns blockstamp given comma-separated blocklist ids
-func (r *rethinkdns) FlagsToStamp(flagscsv string, enctyp int) (string, error) {
-	return r.flagsToStamp(flagscsv, enctyp)
+func (r *rethinkdns) FlagsToStamp(flagscsv *x.Gostr, enctyp int) (*x.Gostr, error) {
+	return x.StrOfFunc2(r.flagsToStamp, flagscsv.V(), enctyp)
 }
 
 func (r *rethinkdns) flagsToStamp(flagscsv string, enctyp int) (string, error) {
@@ -235,8 +228,8 @@ func (r *rethinkdns) flagsToStamp(flagscsv string, enctyp int) (string, error) {
 }
 
 // Returns comma-separated blocklist ids, given a stamp of form version:base64
-func (r *rethinkdns) StampToFlags(stamp string) (string, error) {
-	return r.stampToFlags(stamp)
+func (r *rethinkdns) StampToFlags(stamp *x.Gostr) (*x.Gostr, error) {
+	return x.StrOfFunc1(r.stampToFlags, stamp.V())
 }
 
 func (r *rethinkdns) stampToFlags(stamp string) (string, error) {
@@ -253,8 +246,8 @@ func (r *rethinkdns) stampToFlags(stamp string) (string, error) {
 	return strings.Join(blocklistids[:], ","), nil
 }
 
-func (r *rethinkdns) StampToNames(stamp string) (string, error) {
-	return r.stampToNames(stamp)
+func (r *rethinkdns) StampToNames(stamp *x.Gostr) (*x.Gostr, error) {
+	return x.StrOfFunc1(r.stampToNames, stamp.V())
 }
 
 func (r *rethinkdns) stampToNames(stamp string) (string, error) {

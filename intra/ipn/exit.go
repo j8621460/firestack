@@ -13,7 +13,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"strconv"
-	"sync/atomic"
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
@@ -29,7 +28,6 @@ const (
 
 // exit is a proxy that always dials out to the internet.
 type exit struct {
-	// TODO: set dnsx.System as DNS for exit and base
 	NoDNS
 	ProtoAgnostic
 	SkipRefresh
@@ -37,10 +35,8 @@ type exit struct {
 	GWNoVia
 	id       string
 	addr     string
-	hdl      uint64
-	dhdl     uint64
 	outbound *protect.RDial // outbound dialer
-	status   atomic.Int32
+	status   *core.Volatile[int]
 	done     context.CancelFunc
 }
 
@@ -65,23 +61,20 @@ func newExitProxy(id, addr string, ctx context.Context, c protect.Controller) *e
 		id:       id,
 		addr:     addr,
 		outbound: protect.MakeNsRDial(Exit, ctx, c),
+		status:   core.NewVolatile(TUP),
 		done:     done,
 	}
-	h.status.Store(TUP) // 0
-	h.since.Store(now())
-	h.hdl = core.Loc(h)
-	h.dhdl = core.Loc(h.outbound)
 	return h
 }
 
 // Handle implements Proxy.
-func (h *exit) Handle() uint64 {
-	return h.hdl
+func (h *exit) Handle() uintptr {
+	return core.Loc(h)
 }
 
 // DialerHandle implements Proxy.
-func (h *exit) DialerHandle() uint64 {
-	return h.dhdl
+func (h *exit) DialerHandle() uintptr {
+	return core.Loc(h.outbound)
 }
 
 // Dial implements Proxy.
@@ -95,37 +88,33 @@ func (h *exit) DialBind(network, local, remote string) (protect.Conn, error) {
 }
 
 func (h *exit) dial(network, local, remote string) (protect.Conn, error) {
-	if err := candial2(h.status.Load()); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
 	// exit always splits
 	c, err := localDialStrat(h.outbound, network, local, remote)
-	defer localDialStatus(&h.status, err)
+	defer localDialStatus(h.status, err)
 
 	kaenabled := maybeKeepAlive(c)
-	n, berr := changeBufferSizes(c)
-	if a, ok := laddr(c); ok {
-		h.lastaddr.Store(&a)
-	}
-	log.I("proxy: %s: dial(%s) %s => %s, ka? %t, sz? %d (%v); err? %v",
-		h.id, network, local, remote, kaenabled, n, berr, err)
+	log.I("proxy: %s: dial(%s) %s => %s, ka? %t; err? %v",
+		h.id, network, local, remote, kaenabled, err)
 	return c, err
 }
 
-// Announce implements [Proxy].
+// Announce implements Proxy.
 func (h *exit) Announce(network, local string) (protect.PacketConn, error) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
 	c, err := dialers.ListenPacket(h.outbound, network, local)
-	defer localDialStatus(&h.status, err)
+	defer localDialStatus(h.status, err)
 	log.I("proxy: %s: announce(%s) on %s; err? %v", h.id, network, local, err)
 	return c, err
 }
 
 // Accept implements Proxy.
 func (h *exit) Accept(network, local string) (protect.Listener, error) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
 	return dialers.Listen(h.outbound, network, local)
@@ -133,11 +122,11 @@ func (h *exit) Accept(network, local string) (protect.Listener, error) {
 
 // Probe implements Proxy.
 func (h *exit) Probe(network, local string) (protect.PacketConn, error) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
 	c, err := dialers.Probe(h.outbound, network, local)
-	defer localDialStatus(&h.status, err)
+	defer localDialStatus(h.status, err)
 	log.I("proxy: %s: probe(%s) on %s; err? %v", h.id, network, local, err)
 	return c, err
 }
@@ -148,13 +137,13 @@ func (h *exit) Dialer() protect.RDialer {
 }
 
 // ID implements x.Proxy.
-func (h *exit) ID() string {
-	return h.id
+func (h *exit) ID() *x.Gostr {
+	return x.StrOf(h.id)
 }
 
 // Type implements x.Proxy.
-func (h *exit) Type() string {
-	return INTERNET
+func (h *exit) Type() *x.Gostr {
+	return x.StrOf(INTERNET)
 }
 
 // Router implements x.Proxy.
@@ -163,20 +152,17 @@ func (h *exit) Router() x.Router {
 }
 
 // Reaches implements x.Router.
-func (h *exit) Reaches(hostportOrIPPortCsv string) bool {
-	return Reaches(h, hostportOrIPPortCsv)
+func (h *exit) Reaches(hostportOrIPPortCsv *x.Gostr) bool {
+	return Reaches(h, hostportOrIPPortCsv.V())
 }
 
 // GetAddr implements x.Proxy.
-func (h *exit) GetAddr() string {
-	if a := h.lastaddr.Load(); a != nil {
-		return *a
-	}
-	return h.addr
+func (h *exit) GetAddr() *x.Gostr {
+	return x.StrOf(h.addr)
 }
 
 // Status implements x.Proxy.
-func (h *exit) Status() int32 {
+func (h *exit) Status() int {
 	return h.status.Load()
 }
 
@@ -188,50 +174,36 @@ func (h *exit) Stop() error {
 	return nil
 }
 
-func localDialStatus(status *atomic.Int32, err error) bool {
+func localDialStatus(status *core.Volatile[int], err error) bool {
 	cur := status.Load()
 	if cur == END || cur == TPU {
 		return false
 	}
 	if err != nil {
-		return status.CompareAndSwap(cur, TKO)
+		return status.Cas(cur, TKO)
 	}
-	return status.CompareAndSwap(cur, TOK)
+	return status.Cas(cur, TOK)
 }
 
 func idhandle(p Proxy) string {
 	if p == nil || core.IsNil(p) {
-		return "<no proxy>"
+		return ""
 	}
-	return idstr(p) + "@" + hdlstr(p)
-}
-
-func refhandle(ref *core.WeakRef[Proxy]) string {
-	if ref == nil {
-		return "<noproxyref>"
-	}
-	return idhandle(ref.Load())
+	return idstr(p) + "@" + strconv.Itoa(int(p.Handle()))
 }
 
 func idstr(p x.Proxy) string {
 	if p == nil || core.IsNil(p) {
 		return ""
 	}
-	return p.ID()
-}
-
-func hdlstr(p Proxy) string {
-	if p == nil || core.IsNil(p) {
-		return ""
-	}
-	return strconv.FormatUint(p.Handle(), 16)
+	return p.ID().V()
 }
 
 func typstr(p x.Proxy) string {
 	if p == nil || core.IsNil(p) {
 		return ""
 	}
-	return p.Type()
+	return p.Type().V()
 }
 
 // create a random hex character string of length 8

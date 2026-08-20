@@ -87,9 +87,9 @@ func (ic *intercept) handleResponse(packet []byte, truncate bool) ([]byte, error
 		// HasTCFlag is always false because currently transport is TCP only
 		if len(packet) >= xdns.MinDNSPacketSize && xdns.HasTCFlag2(packet) {
 			log.W("dnscrypt: has-tc-flag, retry with tcp, ignore err: %w", err)
-			return packet, nil // return raw packet; caller will retry
+			err = nil
 		}
-		log.E("dnscrypt: intercept-handle-response err: %w", err)
+		log.E("dnscrypt: has-tc-flag not set, intercept-handle-response err: %w", err)
 		return packet, err
 	}
 
@@ -127,12 +127,7 @@ func (ic *intercept) getSetPayloadSize(msg *dns.Msg) error {
 	}
 	var options *[]dns.EDNS0
 	state.dnssec = dnssec
-	// Cap the advertised payload size to the client's safe UDP packet size (minus response
-	// overhead) so that the upstream doesn't send back a response larger than the client
-	// can handle over unencrypted UDP. The client's EDNS0 value (or a safe default of 1252)
-	// is used as the upper bound, not the maximum DNS UDP packet size.
-	clientMax := state.maxUnencryptedUDPSafePayloadSize - ResponseOverhead
-	state.maxPayloadSize = xdns.Min(clientMax, xdns.Max(state.originalMaxPayloadSize, state.maxPayloadSize))
+	state.maxPayloadSize = xdns.Min(xdns.MaxDNSUDPPacketSize-ResponseOverhead, xdns.Max(state.originalMaxPayloadSize, state.maxPayloadSize))
 	if state.maxPayloadSize > 512 {
 		extra2 := []dns.RR{}
 		for _, extra := range msg.Extra {

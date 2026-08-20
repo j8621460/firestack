@@ -10,10 +10,10 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
+	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/dnsx"
 	"github.com/celzero/firestack/intra/ipn"
 	"github.com/celzero/firestack/intra/log"
@@ -31,7 +31,7 @@ type goosr struct {
 	// dialer *protect.RDial
 	exit ipn.Proxy // the only supported proxy is ipn.Exit
 
-	status atomic.Int32
+	status *core.Volatile[int]
 }
 
 var _ dnsx.Transport = (*goosr)(nil)
@@ -55,12 +55,12 @@ func NewGoosTransport(pctx context.Context, pxs ipn.ProxyProvider) (t *goosr, er
 	}
 	ctx, cancel := context.WithCancel(pctx)
 	tx := &goosr{
-		ctx:  ctx,
-		done: cancel,
+		ctx:    ctx,
+		done:   cancel,
+		status: core.NewVolatile(x.Start),
 		// dialer: d,
 		exit: px,
 	}
-	tx.status.Store(dnsx.Start)
 	tx.r = &net.Resolver{
 		PreferGo: true,
 		Dial:     tx.pxdial, // dials in to ipn.Exit, always
@@ -83,7 +83,7 @@ func (t *goosr) send(msg *dns.Msg) (ans *dns.Msg, elapsed time.Duration, qerr *d
 	var err error
 	var ip netip.Addr
 	if msg == nil {
-		qerr = dnsx.NewBadQueryError(dnsx.ErrQueryParse)
+		qerr = dnsx.NewBadQueryError(errQueryParse)
 		return
 	}
 	if qerr = dnsx.WillErr(t); qerr != nil {
@@ -95,7 +95,7 @@ func (t *goosr) send(msg *dns.Msg) (ans *dns.Msg, elapsed time.Duration, qerr *d
 	host := xdns.QName(msg)
 	// TODO: zero length host must return NS records for the root zone
 	if len(host) <= 0 || host == "." {
-		qerr = dnsx.NewBadQueryError(dnsx.ErrNoHost)
+		qerr = dnsx.NewBadQueryError(errNoHost)
 		elapsed = time.Since(start)
 		ans = xdns.Servfail(msg)
 		return
@@ -110,7 +110,7 @@ func (t *goosr) send(msg *dns.Msg) (ans *dns.Msg, elapsed time.Duration, qerr *d
 		if !aquadaq { // TODO: support queries other than A/AAAA
 			log.E("dns53: goosr: not A/AAAA query type for %d:%s", xdns.QType(msg), host)
 			ans = xdns.Servfail(msg)
-			err = dnsx.ErrQueryParse
+			err = errQueryParse
 		} else {
 			proto := "ip4"
 			if xdns.HasAAAAQuestion(msg) {
@@ -165,7 +165,7 @@ func (t *goosr) Query(_ string, q *dns.Msg, smm *x.DNSSummary) (r *dns.Msg, err 
 	smm.RTtl = xdns.RTtl(r)
 	smm.Server = t.getAddr()
 	smm.Status = status
-	smm.PID = t.exit.ID()
+	smm.PID = t.exit.ID().V()
 	if err != nil {
 		smm.Msg = err.Error()
 	}
@@ -176,43 +176,35 @@ func (t *goosr) Query(_ string, q *dns.Msg, smm *x.DNSSummary) (r *dns.Msg, err 
 	return r, err
 }
 
-func (t *goosr) ID() string {
-	return dnsx.Goos
+func (t *goosr) ID() *x.Gostr {
+	return x.StrOf(dnsx.Goos)
 }
 
-func (t *goosr) Type() string {
-	return dnsx.DNS53
+func (t *goosr) Type() *x.Gostr {
+	return x.StrOf(dnsx.DNS53)
 }
 
 func (t *goosr) P50() int64 {
 	return 1 // always fast
 }
 
-func (t *goosr) GetAddr() string {
-	return t.getAddr()
+func (t *goosr) GetAddr() *x.Gostr {
+	return x.StrOf(t.getAddr())
 }
 
 func (t *goosr) getAddr() string {
 	return protect.Localhost + ":53" // dummy
 }
 
-func (t *goosr) Measure(mid string, n, seconds int32) *x.DNSMeasurement {
-	return dnsx.Perf(t, mid, n, seconds)
-}
-
 func (t *goosr) GetRelay() x.Proxy {
 	return nil
-}
-
-func (t *goosr) Relaying() bool {
-	return false
 }
 
 func (t *goosr) IPPorts() []netip.AddrPort {
 	return []netip.AddrPort{netip.AddrPortFrom(netip.IPv6Loopback(), uint16(53))}
 }
 
-func (t *goosr) Status() int32 {
+func (t *goosr) Status() int {
 	return t.status.Load()
 }
 
@@ -220,8 +212,4 @@ func (t *goosr) Stop() error {
 	t.status.Store(dnsx.DEnd)
 	t.done()
 	return nil
-}
-
-func str2ip(host string) (netip.Addr, error) {
-	return netip.ParseAddr(host)
 }

@@ -15,21 +15,29 @@ import (
 )
 
 func (r *resolver) setRdnsLocal(rlocal *rethinkdnslocal) {
+	r.rmu.Lock()
+	defer r.rmu.Unlock()
 	// rlocal can be nil
-	r.rdnsl.Store(rlocal)
+	r.rdnsl = rlocal
 }
 
 func (r *resolver) setRdnsRemote(rremote *rethinkdns) {
+	r.rmu.Lock()
+	defer r.rmu.Unlock()
 	// rremote can be nil
-	r.rdnsr.Store(rremote)
+	r.rdnsr = rremote
 }
 
 func (r *resolver) getRdnsLocal() *rethinkdnslocal {
-	return r.rdnsl.Load()
+	r.rmu.RLock()
+	defer r.rmu.RUnlock()
+	return r.rdnsl
 }
 
 func (r *resolver) getRdnsRemote() *rethinkdns {
-	return r.rdnsr.Load()
+	r.rmu.RLock()
+	defer r.rmu.RUnlock()
+	return r.rdnsr
 }
 
 // Implements RdnsResolver

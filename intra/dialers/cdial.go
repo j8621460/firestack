@@ -25,43 +25,17 @@ var errRetryTimeout = errors.New("dialers: retry timeout")
 
 func reorderIPs(ips []netip.Addr, alwaysExclude netip.Addr) ([]netip.Addr, bool) {
 	failingopen := true
-	front := make([]netip.Addr, 0, len(ips))
-	back := make([]netip.Addr, 0, len(ips))
-
-	if len(ips) == 1 {
-		if alwaysExclude.Compare(ips[0]) == 0 || !ipok(ips[0]) {
-			return back, failingopen
-		}
-		return append(front, ips[0]), !failingopen
-	}
-
 	use4 := Use4()
 	use6 := Use6()
-	only4 := use4 && !use6
-	only6 := use6 && !use4
 
-	prefer4 := use4
-	prefer6 := use6
-	ptmode := settings.PtMode.Load()
-	switch ptmode {
-	case settings.PtModeForce46:
-		prefer6 = true
-	case settings.PtModeForce64:
-		prefer4 = true
-	case settings.PtModeForce:
-		if only4 {
-			prefer4 = true
-		} else if only6 {
-			prefer6 = true
-		} // else: prefer4, prefer6 retain use4, use6 values
-	}
-
+	front := make([]netip.Addr, 0, len(ips))
+	back := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
-		if ip.Compare(alwaysExclude) == 0 || !ipok(ip) {
+		if ip.Compare(alwaysExclude) == 0 || !ip.IsValid() {
 			continue
-		} else if prefer4 && ip.Is4() {
+		} else if use4 && ip.Is4() {
 			front = append(front, ip)
-		} else if prefer6 && ip.Is6() {
+		} else if use6 && ip.Is6() {
 			front = append(front, ip)
 		} else {
 			back = append(back, ip)
@@ -91,7 +65,7 @@ func commondial2[D rdials, C rconns](d D, network, laddr, raddr string, connect 
 	local, lerr := netip.ParseAddrPort(laddr) // okay if local is invalid
 	domain, portstr, err := net.SplitHostPort(raddr)
 
-	if log.Debug {
+	if settings.Debug {
 		log.D("commondial: dialing (host:port) %s=>%s; errs? %v %v",
 			laddr, raddr, lerr, err)
 	}
@@ -119,7 +93,7 @@ func commondial2[D rdials, C rconns](d D, network, laddr, raddr string, connect 
 
 	defer func() {
 		dur := time.Since(start)
-		if log.Debug {
+		if settings.Debug {
 			log.D("commondial: duration: %s; addr %s; confirmed? %s, sz: %d",
 				core.FmtPeriod(dur), raddr, confirmed, ips.Size())
 		}
@@ -129,7 +103,7 @@ func commondial2[D rdials, C rconns](d D, network, laddr, raddr string, connect 
 	// TODO: confirmedIPOK must be used depending on network type "tcp4", "udp4", "tcp6", "udp6" etc
 	if confirmedIPOK {
 		remote := netip.AddrPortFrom(confirmed, uint16(port))
-		if log.Verbose {
+		if settings.Debug {
 			log.V("commondial: dialing confirmed ip %s for %s", confirmed, remote)
 		}
 		conn, err = connect(d, network, local, remote)
@@ -138,7 +112,7 @@ func commondial2[D rdials, C rconns](d D, network, laddr, raddr string, connect 
 			err = core.OneErr(err, errNoConn)
 		}
 		if err == nil {
-			if log.Verbose {
+			if settings.Debug {
 				log.V("commondial: ip %s works for %s", confirmed, remote)
 			}
 			return conn, nil
@@ -167,20 +141,15 @@ func commondial2[D rdials, C rconns](d D, network, laddr, raddr string, connect 
 			ipset = ips.Addrs()
 			ordered, failingopen = reorderIPs(ipset, confirmed)
 		}
-		if log.Debug {
-			log.D("commondial: renew ips for %s; renewed? %t, failingopen? %t", raddr, renewed, failingopen)
-		}
+		log.D("commondial: renew ips for %s; renewed? %t, failingopen? %t", raddr, renewed, failingopen)
 	}
-
-	if log.Debug {
-		log.D("commondial: trying all ips %d/%d %v for %s, failingopen? %t",
-			len(ordered), len(ipset), ordered, raddr, failingopen)
-	}
+	log.D("commondial: trying all ips %d/%d %v for %s, failingopen? %t",
+		len(ordered), len(ipset), ordered, raddr, failingopen)
 	for _, ip := range ordered {
 		end := time.Since(start)
 		if end > dialRetryTimeout {
 			errs = core.JoinErr(errs, errRetryTimeout)
-			log.W("commondial: timeout %s for %s", end, raddr)
+			log.D("commondial: timeout %s for %s", end, raddr)
 			break
 		}
 		if ipok(ip) {

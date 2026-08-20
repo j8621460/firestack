@@ -14,7 +14,6 @@
 package wg
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -35,7 +34,7 @@ var (
 
 	baTtl    = 30 * time.Second
 	baNegTtl = 2 * time.Second
-	ba       = core.NewBarrier2[*ifstats, uint64](context.TODO(), "wg.s.bar", baTtl, baNegTtl)
+	ba       = core.NewBarrier2[*ifstats, uintptr](baTtl, baNegTtl)
 )
 
 // peerstats represents the statistics for a peer.
@@ -136,17 +135,17 @@ func (s *ifstats) LatestRecentHandshake() int64 {
 	return least
 }
 
-func ReadStats(who string, id uint64, cfn core.Work[string]) *ifstats {
+func ReadStats(who string, id uintptr, cfn core.Work[string]) *ifstats {
 	v, err := ba.DoIt(id, func() (*ifstats, error) {
 		cfg, err := cfn()
 		if err != nil || len(cfg) <= 0 {
-			log.W("wg: ReadStats: %s: %s: ipcget: %v", who, strconv.FormatUint(id, 16), err)
+			log.W("wg: ReadStats: %s: %d: ipcget: %v", who, id, err)
 			return nil, err
 		}
 		return readStats(who, cfg)
 	})
 	if err != nil { // v is nil when ba.Do timesout or no handshake yet
-		log.W("wg: ReadStats: %s nil for %s, err: %v", who, strconv.FormatUint(id, 16), err)
+		log.W("wg: ReadStats: %s nil for %d, err: %v", who, id, err)
 	}
 	return v
 }

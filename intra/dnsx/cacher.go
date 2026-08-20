@@ -108,10 +108,10 @@ type ctransport struct {
 var _ Cacher = (*ctransport)(nil)
 
 func NewDefaultCachingTransport(t Transport) Transport {
-	return NewCachingTransport(context.Background(), t, defttl)
+	return NewCachingTransport(t, defttl)
 }
 
-func NewCachingTransport(pctx context.Context, t Transport, ttl time.Duration) Transport {
+func NewCachingTransport(t Transport, ttl time.Duration) Transport {
 	if t == nil {
 		return nil
 	}
@@ -121,11 +121,11 @@ func NewCachingTransport(pctx context.Context, t Transport, ttl time.Duration) T
 		log.I("cache: (%s) no-op: %s", t.ID(), t.GetAddr())
 		return t
 	}
-	if strings.HasPrefix(t.GetAddr(), algprefix) {
+	if strings.HasPrefix(t.GetAddr().V(), algprefix) {
 		log.W("cache: (%s) no-op for alg: %s", t.ID(), t.GetAddr())
 		return t
 	}
-	ctx, done := context.WithCancel(pctx)
+	ctx, done := context.WithCancel(context.Background())
 	ct := &ctransport{
 		Transport:  t,
 		ctx:        ctx,
@@ -136,7 +136,7 @@ func NewCachingTransport(pctx context.Context, t Transport, ttl time.Duration) T
 		halflife:   ttl / 2,
 		bumps:      defbumps,
 		size:       defsize,
-		reqbarrier: core.NewBarrier[*cres](ctx, "dnsx.c.reqbar", battl),
+		reqbarrier: core.NewBarrier[*cres](battl),
 		hangover:   core.NewHangover(),
 	}
 	context.AfterFunc(ctx, ct.Clear)
@@ -217,7 +217,7 @@ func (cb *cache) scrubCache() {
 	// scrub the cache if it's getting too big
 	highload := len(cb.c) >= cb.size*75/100
 
-	i, j := 0, 0
+	i, j, m := 0, 0, 0
 	for k, v := range cb.c {
 		i++
 		if highload && time.Since(v.expiry) > 0 {
@@ -230,12 +230,12 @@ func (cb *cache) scrubCache() {
 			break
 		}
 	}
-	log.I("cache: del: %d; tot: %d / high? %t", j, i, highload)
+	log.I("cache: del: %d; ref: %d; tot: %d / high? %t", j, m, i, highload)
 }
 
 func (cb *cache) freshCopy(key string) (v *cres, ok bool) {
-	cb.mu.Lock() // write lock: bumps expiry/count on the shared *cres in-place
-	defer cb.mu.Unlock()
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
 
 	if v, ok = cb.c[key]; !ok {
 		return
@@ -333,9 +333,9 @@ func asResponse(q *dns.Msg, v *cres, fresh bool) (a *dns.Msg, s *x.DNSSummary, e
 		return
 	}
 	aname := qname(a)
-	rname := qname(q)
-	if aname != rname {
-		log.E("cache: asResponse: qname mismatch: a(%s) != q(%s)", aname, rname)
+	qname := qname(q)
+	if aname != qname {
+		log.E("cache: asResponse: qname mismatch: a(%s) != q(%s)", aname, qname)
 		err = errCacheResponseMismatch
 		return
 	}
@@ -351,12 +351,12 @@ func asResponse(q *dns.Msg, v *cres, fresh bool) (a *dns.Msg, s *x.DNSSummary, e
 	return
 }
 
-func (t *ctransport) ID() string {
+func (t *ctransport) ID() *x.Gostr {
 	// must match with how wrapping transports like DcProxy / Gateway rely on the ID
-	return CT + t.Transport.ID()
+	return x.StrOf(CT + t.Transport.ID().V())
 }
 
-func (t *ctransport) Type() string {
+func (t *ctransport) Type() *x.Gostr {
 	return t.Transport.Type()
 }
 
@@ -392,7 +392,7 @@ func (t *ctransport) fetch(network string, q *dns.Msg, smmout *x.DNSSummary, cb 
 		})
 
 		if cc == nil { // may be nil for example when barrier times outs
-			log.E("cache: barrier: %s; nil return for %s; err? %v", idstr(t), key, err)
+			log.E("cache: barrier: %s; nil return for %s; err? %v", t.ID(), key, err)
 			cc = ccx
 		}
 
@@ -422,7 +422,6 @@ func (t *ctransport) fetch(network string, q *dns.Msg, smmout *x.DNSSummary, cb 
 			smm2.Msg = err.Error()
 			smm2.RCode = dns.RcodeBadTime
 			smm2.Status = SendFailed
-			smm2.Cached = true
 			// do not return any response (stall / drop silently)
 			return nil, err
 		}
@@ -430,7 +429,6 @@ func (t *ctransport) fetch(network string, q *dns.Msg, smmout *x.DNSSummary, cb 
 		// fres may be nil
 		fres, cachedsmm, ferr := asResponse(q2, cachedres, fresh)
 		fillSummary(cachedsmm, smm2) // cachedsmm may itself be smm2
-		smm2.Cached = true
 
 		return fres, core.JoinErr(err, ferr)
 	}
@@ -443,14 +441,7 @@ func (t *ctransport) fetch(network string, q *dns.Msg, smmout *x.DNSSummary, cb 
 	// has 10s elapsed since the first send failure
 	trok := t.hangover.Within(httl)
 
-	// only check cache when transport is likely connected;
-	// skip freshCopy when !trok to avoid wasting bumps
-	var v *cres
-	var isfresh bool
-	if trok {
-		v, isfresh = cb.freshCopy(key)
-	}
-	if trok && v != nil {
+	if v, isfresh := cb.freshCopy(key); trok && v != nil {
 		var cachedsmm *x.DNSSummary
 		hasans := v.ans != nil
 
@@ -473,7 +464,7 @@ func (t *ctransport) fetch(network string, q *dns.Msg, smmout *x.DNSSummary, cb 
 			// fallthrough to sendRequest
 		} else if cachedsmm != nil {
 			if !isfresh { // not fresh, fetch in the background
-				core.Gx("c.sendRequest: "+key+t.ID(), func() {
+				core.Gx("c.sendRequest: "+key+t.ID().V(), func() {
 					_, _ = sendRequest(q.Copy(), copySummary(smmout)) // summary may be cached
 				})
 			}
@@ -525,16 +516,16 @@ func (t *ctransport) P50() int64 {
 	return 0
 }
 
-func (t *ctransport) GetAddr() string {
-	prefix := TransportPrefix(CT)
-	return prefix + t.Transport.GetAddr()
+func (t *ctransport) GetAddr() *x.Gostr {
+	prefix := PrefixFor(CT)
+	return x.StrOf(prefix + t.Transport.GetAddr().V())
 }
 
 func (t *ctransport) IPPorts() []netip.AddrPort {
 	return t.Transport.IPPorts()
 }
 
-func (t *ctransport) Status() int32 {
+func (t *ctransport) Status() int {
 	return t.Transport.Status()
 }
 
@@ -576,25 +567,15 @@ func fillSummary(s *x.DNSSummary, out *x.DNSSummary) {
 	if len(out.Type) == 0 {
 		out.Type = s.Type
 	}
-	if len(out.Origin) <= 0 {
-		out.Origin = s.Origin
-	}
-
 	if len(out.ID) <= 0 {
 		out.ID = s.ID
 		out.Server = s.Server
+		out.PID = s.PID
+		out.RPID = s.RPID
 	} else if len(out.Server) <= 0 {
 		out.Server = s.Server
-	}
-
-	if len(out.FID) <= 0 {
-		out.FID = s.FID
-	}
-	if len(out.Origin) <= 0 {
-		out.Origin = s.Origin
-	}
-	if out.Start <= 0 {
-		out.Start = s.Start
+		out.PID = s.PID
+		out.RPID = s.RPID
 	}
 	if out.Latency <= 0 {
 		out.Latency = s.Latency
@@ -621,11 +602,6 @@ func fillSummary(s *x.DNSSummary, out *x.DNSSummary) {
 		out.DO = s.DO
 	}
 
-	if len(s.PID) > 0 {
-		out.PID = s.PID
-		out.RPID = s.RPID
-	}
-	out.ECH = s.ECH
 	out.Cached = s.Cached
 	out.RCode = s.RCode
 	out.RTtl = s.RTtl
@@ -634,7 +610,6 @@ func fillSummary(s *x.DNSSummary, out *x.DNSSummary) {
 	out.BlockedTarget = s.BlockedTarget
 	out.Msg = s.Msg
 	out.UpstreamBlocks = s.UpstreamBlocks
-	out.Extra = s.Extra
 }
 
 func rand33pc() bool {

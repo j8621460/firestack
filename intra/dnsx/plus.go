@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -25,7 +24,6 @@ import (
 const plusSupportsCachedTransports = false
 const plusUsesPreferred = false
 const plusUsesSystem = false
-const plusSupportsRelay = false
 
 const plusMaxTries = 6
 
@@ -36,9 +34,8 @@ var fakePlusIpports = []netip.AddrPort{
 }
 
 type plus struct {
-	mu sync.RWMutex // protects all
-	// id => transport; should contain transports owned by Plus
-	transports map[string]Transport
+	mu         sync.RWMutex         // protects all
+	transports map[string]Transport // id => transport
 
 	r       TransportProviderInternal
 	ctx     context.Context
@@ -47,8 +44,8 @@ type plus struct {
 
 	ba *core.Barrier[[]Transport, string]
 
-	closed atomic.Bool
-	last   core.MutexValue[Transport]
+	closed *core.Volatile[bool]
+	last   *core.Volatile[Transport]
 }
 
 var _ Transport = (*plus)(nil)
@@ -59,19 +56,21 @@ func NewPlusTransport(ctx context.Context, r TransportProviderInternal, ts ...Tr
 	t := &plus{
 		ctx:        ctx,
 		transports: make(map[string]Transport, len(ts)),
-		ba:         core.NewBarrier[[]Transport](ctx, "dnsx.p.bar", ttl10s),
+		ba:         core.NewBarrier[[]Transport](ttl10s),
 		r:          r,
 		done:       done,
 		ipports:    fakePlusIpports,
+		closed:     core.NewVolatile(false),
+		last:       core.NewZeroVolatile[Transport](),
 	}
 
 	for _, tr := range ts {
 		if len(idstr(tr)) > 0 {
-			t.transports[tr.ID()] = tr
+			t.transports[tr.ID().V()] = tr
 		}
 	}
 
-	log.I("plus: at %s; added: %d/%d", t.GetAddr(), len(t.transports), len(ts))
+	log.I("plus: at %s; added: %d/%d", t.getAddr(), len(t.transports), len(ts))
 	context.AfterFunc(ctx, t.stopAll)
 	return t
 }
@@ -100,13 +99,13 @@ func (t *plus) all() []Transport {
 	return vals(t.transports, all)
 }
 
-func (t *plus) ID() string {
+func (t *plus) ID() *x.Gostr {
 	// must match with how wrapping transports like DcProxy / Gateway rely on the ID
-	return Plus
+	return x.StrOf(Plus)
 }
 
-func (t *plus) Type() string {
-	return DOH
+func (t *plus) Type() *x.Gostr {
+	return x.StrOf(DOH)
 }
 
 func (t *plus) latest() Transport {
@@ -143,7 +142,7 @@ func (t *plus) preferreddns() (Transport, error) {
 }
 
 func (t *plus) ordered() ([]Transport, error) {
-	_, _, best, preferred, recov, errored, ended := Categorize(t.all())
+	best, preferred, recov, errored, ended := Categorize(t.all())
 
 	expected := len(best) + len(preferred) + len(recov) + 1
 
@@ -243,7 +242,7 @@ func (t *plus) forward(network string, q *dns.Msg, outSmm *x.DNSSummary, all ...
 			continue
 		}
 
-		id := tr.ID()
+		id := tr.ID().V()
 		if plusSupportsCachedTransports {
 			id, _ = strings.CutPrefix(id, CT)
 		}
@@ -262,8 +261,8 @@ func (t *plus) forward(network string, q *dns.Msg, outSmm *x.DNSSummary, all ...
 
 		finalsmm = cursmm
 
-		loged(err != nil || failed)("plus: queried %s for %s:%d (fid: %s); data: %s [noans? %t], code: %d, err? %v",
-			idstr(tr), qname, qtyp, outSmm.FID, finalsmm.RData, noans, finalsmm.RCode, err)
+		loged(err != nil || failed)("plus: queried %s for %s:%d; data: %s [noans? %t], code: %d, err? %v",
+			idstr(tr), qname, qtyp, finalsmm.RData, noans, finalsmm.RCode, err)
 
 		if err != nil || ans == nil {
 			errs = core.JoinErr(errs, core.OneErr(err, errNoAnswer))
@@ -311,35 +310,23 @@ func (t *plus) P50() int64 {
 	return 0
 }
 
-func (t *plus) GetAddr() string {
-	return TransportPrefix(t.ID()) + t.ipports[0].String()
+func (t *plus) GetAddr() *x.Gostr {
+	return x.StrOf(t.getAddr())
 }
 
-func (t *plus) Measure(mid string, n, seconds int32) *x.DNSMeasurement {
-	return Perf(t, mid, n, seconds)
+func (t *plus) getAddr() string {
+	return PrefixFor(t.ID().V()) + t.ipports[0].String()
 }
 
 func (t *plus) GetRelay() x.Proxy {
 	return nil
 }
 
-// Relaying implements dnsx.Transport
-func (t *plus) Relaying() bool {
-	return false // never implements relays
-}
-
 func (t *plus) IPPorts() []netip.AddrPort {
 	return t.ipports
 }
 
-func (t *plus) GetIPs(id string) string {
-	if tr, err := t.GetInternal(id); err == nil {
-		return GetIPCsv(tr)
-	}
-	return ""
-}
-
-func (t *plus) Status() int32 {
+func (t *plus) Status() int {
 	if l := t.latest(); l != nil {
 		return l.Status()
 	}
@@ -363,12 +350,6 @@ func (t *plus) Add(tr x.DNSTransport) bool {
 		return false
 	}
 
-	relayingTransport := newt.Relaying()
-	if relayingTransport && !plusSupportsRelay {
-		log.E("plus: add %s@%s: no relaying transports", newt.ID(), newt.GetAddr())
-		return false
-	}
-
 	cachingTransport := cachedTransport(newt)
 	oldTransportStopped := false
 	if !plusSupportsCachedTransports && cachingTransport {
@@ -379,16 +360,16 @@ func (t *plus) Add(tr x.DNSTransport) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if oldt, ok := t.transports[tr.ID()]; ok {
-		if core.PtrEq(oldt, newt) {
+	if oldt, ok := t.transports[tr.ID().V()]; ok {
+		if oldt == newt {
 			log.I("plus: add %s@%s: already present", newt.ID(), newt.GetAddr())
 			return true
 		}
-		core.Gxe("plus.stop."+oldt.ID(), oldt.Stop)
+		core.Gxe("plus.stop."+oldt.ID().V(), oldt.Stop)
 		oldTransportStopped = true
 	}
 
-	t.transports[tr.ID()] = newt
+	t.transports[tr.ID().V()] = newt
 
 	log.I("plus: add %s@%s; old stopped? %t, cacher? %t",
 		newt.ID(), newt.GetAddr(), oldTransportStopped, cachingTransport)
@@ -396,10 +377,10 @@ func (t *plus) Add(tr x.DNSTransport) bool {
 }
 
 // Remove implements TransportMult.
-func (t *plus) Remove(id string) (y bool) {
+func (t *plus) Remove(id *x.Gostr) (y bool) {
 	t.mu.Lock()
-	tr := t.transports[id]
-	delete(t.transports, id)
+	tr := t.transports[id.V()]
+	delete(t.transports, id.V())
 	t.mu.Unlock()
 
 	if tr != nil {
@@ -413,16 +394,11 @@ func (t *plus) Remove(id string) (y bool) {
 }
 
 // Get implements TransportMult.
-func (t *plus) Get(id string) (x.DNSTransport, error) {
-	return t.GetInternal(id)
-}
-
-// GetInternal implements TransportMult.
-func (t *plus) GetInternal(id string) (Transport, error) {
+func (t *plus) Get(id *x.Gostr) (x.DNSTransport, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if tr, ok := t.transports[id]; ok {
+	if tr, ok := t.transports[id.V()]; ok {
 		return tr, nil
 	}
 	return nil, errNoSuchTransport
@@ -441,7 +417,7 @@ func (t *plus) refresh() {
 }
 
 // Refresh implements TransportMult.
-func (t *plus) Refresh() (string, error) {
+func (t *plus) Refresh() (*x.Gostr, error) {
 	// dialers.Clear in transport.go already clears the cache
 	// that holds ips <> doh hostnames mapping.
 	core.Gx("plus.refresh", t.refresh)
@@ -449,15 +425,15 @@ func (t *plus) Refresh() (string, error) {
 }
 
 // LiveTransports implements TransportMult.
-func (t *plus) LiveTransports() string {
+func (t *plus) LiveTransports() *x.Gostr {
 	var ids []string
 	for _, tr := range t.all() {
 		if activeTransport(tr) {
-			ids = append(ids, tr.ID())
+			ids = append(ids, tr.ID().V())
 		}
 	}
 
-	return strings.Join(ids, ",")
+	return x.StrOf(strings.Join(ids, ","))
 }
 
 func loged(cond bool) log.LogFn {

@@ -8,10 +8,10 @@ package dns53
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -23,6 +23,8 @@ import (
 	"github.com/celzero/firestack/intra/settings"
 	"github.com/celzero/firestack/intra/xdns"
 	"github.com/miekg/dns"
+
+	_ "go4.org/unsafe/assume-no-moving-gc"
 )
 
 const (
@@ -37,11 +39,7 @@ const (
 	mdnstimeout = 5 * time.Second  // default timeout for MDNS
 )
 
-var (
-	errQueryParse = dnsx.ErrQueryParse
-	errNoNet      = dnsx.ErrNoNet
-	errNoAns      = dnsx.ErrNoAns
-)
+var errQueryParse = errors.New("dns53: err parse query")
 
 // TODO: Keep a context here so that queries can be canceled.
 type transport struct {
@@ -50,20 +48,19 @@ type transport struct {
 
 	id string
 
-	addrport string // hostname, ip:port, protect.Selfhost:53, protect.Systemhost:53, protect.HostlessXYZ:53
+	addrport string // hostname, ip:port, protect.UidSelf:53, protect.System:53, protect.HostlessXYZ:53
 	port     uint16
 
-	client   *dns.Client
-	proxies  ipn.ProxyProvider        // should never be nil
-	relay    string                   // may be empty
-	relayref *core.WeakRef[ipn.Proxy] // preset ref to relay proxy, if any
+	client  *dns.Client
+	proxies ipn.ProxyProvider // should never be nil
+	relay   string            // may be empty
 
-	pool    *core.MultConnPool[uint64]
+	pool    *core.MultConnPool[uintptr]
 	usepool bool
 
 	est      core.P2QuantileEstimator
-	lastaddr atomic.Pointer[string] // last resolved addr
-	status   atomic.Int32           // status of the transport
+	lastaddr *core.Volatile[string] // last resolved addr
+	status   *core.Volatile[int]    // status of the transport
 }
 
 var _ dnsx.Transport = (*transport)(nil)
@@ -71,8 +68,6 @@ var _ dnsx.Transport = (*transport)(nil)
 // NewTransportFromHostname returns a DNS53 transport serving from hostname, ready for use.
 func NewTransportFromHostname(ctx context.Context, id, hostOrHostport string, ipcsv string, px ipn.ProxyProvider) (t *transport, err error) {
 	// ipcsv may contain port, eg: 10.1.1.3:53
-	// as a special case, the id may be "Bootstrap", and the corresponding
-	// hostOrHostport may be [protect.Selfhost] or [protect.Hostname]
 	do, err := settings.NewDNSOptionsFromHostname(hostOrHostport, ipcsv)
 	if err != nil {
 		return
@@ -99,35 +94,30 @@ func newTransport(pctx context.Context, id string, do *settings.DNSOptions, px i
 	}
 	ctx, done := context.WithCancel(pctx)
 	var relay string
-	var relayref *core.WeakRef[ipn.Proxy]
-	if dnsx.CanUseProxy(id) { // see also: pxdial
+	if dnsx.CanUseProxy(id) {
 		if p, _ := px.ProxyFor(id); p != nil {
-			relay = p.ID()
-			if ref, err := px.ProxyRef("relay.dns53."+id, relay); err == nil {
-				relayref = ref
-			}
+			relay = p.ID().V()
 		}
 	}
 	tx := &transport{
-		ctx:  ctx,
-		done: done,
-		id:   id,
-		// may be hostname:port or ip:port or protect.Selfhost or protect.Systemhost
-		addrport: do.AddrPort(),
+		ctx:      ctx,
+		done:     done,
+		id:       id,
+		addrport: do.AddrPort(), // may be hostname:port or ip:port
 		port:     do.Port(),
-		pool:     core.NewMultConnPool[uint64](ctx),
+		status:   core.NewVolatile(dnsx.Start),
+		lastaddr: core.NewZeroVolatile[string](),
+		pool:     core.NewMultConnPool[uintptr](ctx),
 		// todo: renable once we know why pooled wireguard dns conns are troublesome
-		usepool:  false,
-		proxies:  px,       // never nil; see above
-		relay:    relay,    // may be empty
-		relayref: relayref, // may be nil
-		est:      core.NewP50Estimator(ctx),
+		usepool: false,
+		proxies: px,    // never nil; see above
+		relay:   relay, // may be empty
+		est:     core.NewP50Estimator(ctx),
 	}
-	tx.status.Store(dnsx.Start)
 	ipcsv := do.ResolvedAddrs()
 	hasips := len(ipcsv) > 0
 	ips := strings.Split(ipcsv, ",")               // may be nil or empty or ip:port
-	ok := dnsx.RegisterAddrs(id, tx.addrport, ips) // addrport may be protect.Selfhost or protect.Systemhost
+	ok := dnsx.RegisterAddrs(id, tx.addrport, ips) // addrport may be protect.UidSelf or protect.System
 	log.I("dns53: (%s) pre-resolved %s to %s; ok? %t", id, tx.addrport, ipcsv, ok)
 	tx.client = &dns.Client{
 		Net:     "udp", // default transport type
@@ -152,18 +142,10 @@ func NewTransportFrom(ctx context.Context, id string, ipp netip.AddrPort, px ipn
 	return newTransport(ctx, id, do, px)
 }
 
-func (t *transport) pxdial(network, pid string) (*dns.Conn, string, uint64, error) {
-	// dnsx.CanUseProxy may return true even when Bootstrap is System DNS
-	if t.id == dnsx.Bootstrap || t.id == dnsx.System || !dnsx.CanUseProxy(t.id) { // bootstrap/default never be proxied
+func (t *transport) pxdial(network, pid string) (*dns.Conn, string, uintptr, error) {
+	if t.id == dnsx.Bootstrap || t.id == dnsx.System { // bootstrap/default never be proxied
 		// never proxy dns53 transport with "bootstrap" id is a clone of dnsx.System
-		if settings.Loopingback.Load() {
-			// TODO: if system dns is always exited (regardless of whether "self uid" is set
-			// to be proxies by user-set rules, that is, by kotlin-land in Flow()), then
-			// dnsx.NetBaseProxy is okay to use in loopback scenarios.
-			pid = dnsx.NetExitProxy
-		} else {
-			pid = dnsx.NetBaseProxy
-		}
+		pid = dnsx.NetBaseProxy
 	} else if len(t.relay) > 0 { // relay takes precedence
 		pid = t.relay
 	}
@@ -180,7 +162,7 @@ func (t *transport) pxdial(network, pid string) (*dns.Conn, string, uint64, erro
 		return c, rpid, who, nil
 	}
 
-	if log.Verbose {
+	if settings.Debug {
 		log.V("dns53: pxdial: (%s) using %s relay/proxy %s at %s",
 			t.id, network, px.ID(), px.GetAddr())
 	}
@@ -201,7 +183,7 @@ func (t *transport) pxdial(network, pid string) (*dns.Conn, string, uint64, erro
 }
 
 // toPool takes ownership of c.
-func (t *transport) toPool(id uint64, c *dns.Conn) {
+func (t *transport) toPool(id uintptr, c *dns.Conn) {
 	if !t.usepool || id == core.Nobody {
 		clos(c)
 		return
@@ -211,7 +193,7 @@ func (t *transport) toPool(id uint64, c *dns.Conn) {
 }
 
 // fromPool returns a conn from the pool, if available.
-func (t *transport) fromPool(id uint64) (c *dns.Conn) {
+func (t *transport) fromPool(id uintptr) (c *dns.Conn) {
 	if !t.usepool || id == core.Nobody {
 		return
 	}
@@ -225,13 +207,13 @@ func (t *transport) fromPool(id uint64) (c *dns.Conn) {
 		log.W("dns53: pool: (%s) not a dns.Conn for %d!", t.id, id)
 		return &dns.Conn{Conn: pooled}
 	}
-	if log.Debug {
+	if settings.Debug {
 		log.V("dns53: pool: (%s) got conn for %d", t.id, id)
 	}
 	return
 }
 
-func (t *transport) connect(network, pid string) (conn *dns.Conn, rpid string, who uint64, err error) {
+func (t *transport) connect(network, pid string) (conn *dns.Conn, rpid string, who uintptr, err error) {
 	useudp := network == dnsx.NetTypeUDP
 	userelay := len(t.relay) > 0
 	useproxy := len(pid) != 0 // pid == dnsx.NetNoProxy => ipn.Block
@@ -291,13 +273,13 @@ func (t *transport) send(network, pid string, q *dns.Msg) (ans *dns.Msg, rpid st
 		dialers.Confirm2(t.addrport, lastaddr)
 	}
 
-	t.lastaddr.Store(&lastaddr)
+	t.lastaddr.Store(lastaddr)
 
 	return
 }
 
-func (t *transport) chooseProxy(fid string, pids ...string) string {
-	return dnsx.ChooseHealthyProxyHostPort(fid+" dns53."+t.id, dnsx.NetTypeUDP, t.addrport, t.port, pids, t.proxies)
+func (t *transport) chooseProxy(pids ...string) string {
+	return dnsx.ChooseHealthyProxyHostPort("dns53: "+t.id, t.addrport, t.port, pids, t.proxies)
 }
 
 func (t *transport) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *dns.Msg, err error) {
@@ -305,9 +287,9 @@ func (t *transport) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *d
 	proto, pids := xdns.Net2ProxyID(network)
 
 	if r := t.relay; len(r) > 0 {
-		pid = t.chooseProxy(smm.FID, r)
+		pid = t.chooseProxy(r)
 	} else {
-		pid = t.chooseProxy(smm.FID, pids...)
+		pid = t.chooseProxy(pids...)
 	}
 
 	ans, rpid, elapsed, qerr := t.send(proto, pid, q)
@@ -321,8 +303,6 @@ func (t *transport) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *d
 		status = qerr.Status()
 		log.W("dns53: (%s) err(%v) / size(%d)", t.id, err, xdns.Len(ans))
 	}
-	// may store dnsx.Paused which is NOT a reflection of
-	// the correct state of this transport
 	t.status.Store(status)
 
 	smm.Latency = elapsed.Seconds()
@@ -338,64 +318,51 @@ func (t *transport) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *d
 	smm.Status = status
 	t.est.Add(smm.Latency)
 
-	if log.Debug {
-		log.V("dns53: (%s) fid: %s; len(res): %d, data: %s, via: %s, err? %v",
-			t.id, smm.FID, xdns.Len(ans), smm.RData, smm.PID, err)
+	if settings.Debug {
+		log.V("dns53: (%s) len(res): %d, data: %s, via: %s, err? %v",
+			t.id, xdns.Len(ans), smm.RData, smm.PID, err)
 	}
 
 	return ans, err
 }
 
-func (t *transport) ID() string {
-	return t.id
+func (t *transport) ID() *x.Gostr {
+	return x.StrOf(t.id)
 }
 
-func (t *transport) Type() string {
-	return dnsx.DNS53
+func (t *transport) Type() *x.Gostr {
+	return x.StrOf(dnsx.DNS53)
 }
 
 func (t *transport) P50() int64 {
 	return t.est.Get()
 }
 
-func (t *transport) GetAddr() string {
-	return t.getAddr()
+func (t *transport) GetAddr() *x.Gostr {
+	return x.StrOf(t.getAddr())
 }
 
 func (t *transport) getAddr() string {
 	addr := t.lastaddr.Load()
-	var s string
-	if addr == nil || len(*addr) == 0 {
-		// may be protect.Selfhost (for bootstrap/default) or protect.Systemhost
-		s = t.addrport
-	} else {
-		s = *addr
+	if len(addr) == 0 {
+		// may be protect.UidSelf (for bootstrap/default) or protect.System
+		addr = t.addrport
 	}
 
-	prefix := dnsx.TransportPrefix(t.id)
+	prefix := dnsx.PrefixFor(t.id)
 	if len(prefix) > 0 {
-		s = prefix + s
+		addr = prefix + addr
 	}
 
-	return s
-}
-
-func (t *transport) Measure(mid string, n, seconds int32) *x.DNSMeasurement {
-	return dnsx.Perf(t, mid, n, seconds)
+	return addr
 }
 
 func (t *transport) GetRelay() x.Proxy {
-	if t.relayref == nil {
-		return nil
-	}
-	if p, valid := t.relayref.Get(); valid {
-		return p
+	if r := t.relay; len(r) > 0 {
+		px, _ := t.proxies.ProxyFor(r)
+		return px
 	}
 	return nil
-}
-
-func (t *transport) Relaying() bool {
-	return len(t.relay) > 0
 }
 
 func (t *transport) IPPorts() (ipps []netip.AddrPort) {
@@ -405,21 +372,13 @@ func (t *transport) IPPorts() (ipps []netip.AddrPort) {
 	return
 }
 
-func (t *transport) Status() int32 {
+func (t *transport) Status() int {
 	if px := t.GetRelay(); px != nil {
-		if y, to := dnsx.OverrideStatusFrom(px); y {
-			return to
+		if px.Status() == ipn.TPU {
+			return dnsx.Paused
 		}
 	}
-
-	s := t.status.Load()
-	if s == dnsx.Paused {
-		// paused status is a pseudo state dependent on underlying relay
-		// or requested pid, not a permanent state of this transport.
-		t.status.CompareAndSwap(s, dnsx.Unpaused)
-		return dnsx.Unpaused
-	}
-	return s
+	return t.status.Load()
 }
 
 func (t *transport) Stop() error {

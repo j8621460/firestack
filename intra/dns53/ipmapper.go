@@ -4,7 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-package dnsx
+package dns53
 
 import (
 	"context"
@@ -12,50 +12,104 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/celzero/firestack/intra/core"
+	"github.com/celzero/firestack/intra/dialers"
+	"github.com/celzero/firestack/intra/dnsx"
 	"github.com/celzero/firestack/intra/log"
 	"github.com/celzero/firestack/intra/protect"
 	"github.com/celzero/firestack/intra/protect/ipmap"
+	"github.com/celzero/firestack/intra/settings"
 	"github.com/celzero/firestack/intra/xdns"
 	"github.com/miekg/dns"
 )
 
+const battl = 10 * time.Second
+
 var (
-	ErrNoAns      = errNoAnswer
-	ErrNoHost     = errors.New("no hostname")
-	ErrNoNet      = errors.New("unknown network")
-	ErrQueryParse = errors.New("cannot parse dns query")
+	errNoHost = errors.New("no hostname")
+	errNoAns  = errors.New("no answer")
+	errNoNet  = errors.New("unknown network")
 
 	loopback4 = netip.AddrFrom4([4]byte{127, 0, 0, 1})
 	loopback6 = netip.IPv6Loopback()
 )
 
 type answer struct {
-	a        *dns.Msg
+	a        []byte
 	tid, uid string
 }
 
-var _ ipmap.IPMapper = (*resolver)(nil)
+type ipmapper struct {
+	id string
+	r  dnsx.ResolverSelf
+	g  dnsx.Gateway
+	ba *core.Barrier[answer, string]
+}
+
+var _ ipmap.IPMapper = (*ipmapper)(nil)
+
+// AddIPMapper adds or removes the IPMapper.
+func AddIPMapper(r dnsx.Resolver, protos string, clear bool) {
+	var m ipmap.IPMapper // nil
+	ok := r != nil
+	if ok {
+		m = &ipmapper{
+			id: dnsx.IpMapper,
+			r:  r,
+			g:  r.Gateway(),
+			ba: core.NewBarrier[answer](battl),
+		}
+	} // else remove; m is nil
+	if clear {
+		dialers.Clear() // note: clears ipset async
+	}
+	dialers.Mapper(m)
+	dialers.IPProtos(protos)
+}
 
 func str2ip(host string) (netip.Addr, error) {
 	return netip.ParseAddr(host)
 }
 
-// Implements [ResolverSelf].
-func (m *resolver) Lookup(q *dns.Msg, uid string, tids ...string) (*dns.Msg, error) {
-	return m.queryAny(q, uid, tids...)
+// Implements IPMapper.
+func (m *ipmapper) Lookup(q []byte, tids ...string) ([]byte, error) {
+	return m.queryAny(q, tids...)
 }
 
-// Implements [ResolverSelf].
-func (m *resolver) LookupNetIP(ctx context.Context, network, host, uid string, tids ...string) ([]netip.Addr, error) {
-	return m.queryIP(ctx, network, host, uid, tids...)
+// Implements IPMapper.
+func (m *ipmapper) LookupFor(q []byte, uid string) ([]byte, error) {
+	return m.queryAny2(q, uid)
+}
+
+// Implements IPMapper.
+func (m *ipmapper) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return m.queryIP(ctx, network, host, core.UNKNOWN_UID_STR)
+}
+
+// Implements IPMapper.
+func (m *ipmapper) LookupNetIPFor(ctx context.Context, network, host, uid string) ([]netip.Addr, error) {
+	return m.queryIP(ctx, network, host, uid)
+}
+
+// Implements IPMapper.
+func (m *ipmapper) LookupNetIPOn(ctx context.Context, network, host string, tid ...string) ([]netip.Addr, error) {
+	return m.queryIP2(ctx, network, host, core.UNKNOWN_UID_STR, tid...)
+}
+
+func (m *ipmapper) queryIP(ctx context.Context, network, host string, uid string) ([]netip.Addr, error) {
+	return m.queryIP2(ctx, network, host, uid)
+}
+
+func (m *ipmapper) queryAny(q []byte, tids ...string) ([]byte, error) {
+	return m.queryAny2(q, core.UNKNOWN_UID_STR, tids...)
 }
 
 // todo: use context
-func (m *resolver) queryIP(_ context.Context, network, host, uid string, tids ...string) ([]netip.Addr, error) {
+func (m *ipmapper) queryIP2(_ context.Context, network, host, uid string, tid ...string) ([]netip.Addr, error) {
 	if len(host) <= 0 {
-		return nil, ErrNoHost
+		return nil, errNoHost
 	}
 	if protect.NeverResolve(host) {
 		return nil, nil
@@ -65,17 +119,15 @@ func (m *resolver) queryIP(_ context.Context, network, host, uid string, tids ..
 	}
 	// no lookups when host is already an IP
 	if ip, err := str2ip(host); err == nil {
-		if log.Verbose {
-			log.V("ipmapper: lookup: no-op; host %s is ipaddr", host)
-		}
+		log.V("ipmapper: lookup: no-op; host %s is ipaddr", host)
 		return []netip.Addr{ip}, nil
 	}
 
-	if log.Verbose {
-		log.V("ipmapper: lookup: host %s:%s for %s on %v", network, host, uid, tids)
+	if settings.Debug {
+		log.V("ipmapper: lookup: host %s:%s for %s on %v", network, host, uid, tid)
 	}
 
-	var q4, q6 *dns.Msg
+	var q4, q6 []byte
 	var err4, err6 error
 	switch network {
 	case "ip":
@@ -87,7 +139,7 @@ func (m *resolver) queryIP(_ context.Context, network, host, uid string, tids ..
 		q6, err6 = dnsmsg(host, dns.TypeAAAA)
 	default:
 		log.E("ipmapper: lookup: unknown net %s query %s", network, host)
-		return nil, ErrNoNet
+		return nil, errNoNet
 	}
 
 	if err4 != nil || err6 != nil {
@@ -97,25 +149,25 @@ func (m *resolver) queryIP(_ context.Context, network, host, uid string, tids ..
 	}
 
 	var val4, val6 *core.V[answer, string]
-	if len(tids) > 0 { // always choose one among these tids
-		val4, _ = m.ba.Do(bakey4(host, tids...), m.lookupon(q4, uid, tids...))
-		val6, _ = m.ba.Do(bakey6(host, tids...), m.lookupon(q6, uid, tids...))
-	} else if uid != core.UNKNOWN_UID_STR { // client code chooses a tid depending on uid & "origin"
-		val4, _ = m.ba.Do(bakey4(host, uid), m.lookupfor(q4, uid))
-		val6, _ = m.ba.Do(bakey6(host, uid), m.lookupfor(q6, uid))
+	if len(tid) > 0 { // always choose one among these tids
+		val4, _ = m.ba.Do(key4(host, tid...), m.lookupon(q4, tid...))
+		val6, _ = m.ba.Do(key6(host, tid...), m.lookupon(q6, tid...))
+	} else if uid != core.UNKNOWN_UID_STR { // client code chooses a tid
+		val4, _ = m.ba.Do(key4(host, uid), m.lookupfor(q4, uid))
+		val6, _ = m.ba.Do(key6(host, uid), m.lookupfor(q6, uid))
 	} else { // either Default or System/Goos
-		val4, _ = m.ba.Do(bakey4(host, Default), m.locallookup(q4))
-		val6, _ = m.ba.Do(bakey6(host, Default), m.locallookup(q6))
+		val4, _ = m.ba.Do(key4(host, dnsx.Default), m.locallookup(q4))
+		val6, _ = m.ba.Do(key6(host, dnsx.Default), m.locallookup(q6))
 	}
 
 	var noval4, noval6 bool
-	var r4, r6 *dns.Msg
+	var r4, r6 []byte
 	var tid4, tid6 string
 	var lerr4, lerr6 error
 	if val4 == nil {
 		noval4 = true
 	} else {
-		noval4 = val4.Val.a == nil
+		noval4 = len(val4.Val.a) <= 0
 		r4 = val4.Val.a     // may be nil
 		lerr4 = val4.Err    // may be nil
 		tid4 = val4.Val.tid // may be empty
@@ -123,7 +175,7 @@ func (m *resolver) queryIP(_ context.Context, network, host, uid string, tids ..
 	if val6 == nil {
 		noval6 = true
 	} else {
-		noval6 = val6.Val.a == nil
+		noval6 = len(val6.Val.a) <= 0
 		r6 = val6.Val.a     // may be nil
 		lerr6 = val6.Err    // may be nil
 		tid6 = val6.Val.tid // may be empty
@@ -134,10 +186,10 @@ func (m *resolver) queryIP(_ context.Context, network, host, uid string, tids ..
 		log.E("ipmapper: lookup: %s: err %v", host, errs)
 		return nil, errs
 	} else if noval4 && noval6 { // typecast failed or no answer
-		log.E("ipmapper: lookup: no answers for %s; len(4)? %d len(6)? %d", host, xdns.Len(r4), xdns.Len(r6))
-		return nil, ErrNoAns
-	} else if r4 == nil && r6 == nil { // empty answer
-		errs := core.JoinErr(ErrNoAns, lerr4, lerr6)
+		log.E("ipmapper: lookup: no answers for %s; len(4)? %d len(6)? %d", host, len(r4), len(r6))
+		return nil, errNoAns
+	} else if len(r4) <= 0 && len(r6) <= 0 { // empty answer
+		errs := core.JoinErr(errNoAns, lerr4, lerr6)
 		log.E("ipmapper: lookup: no answers for %s (by: %s+%s), err %v", host, tid4, tid6, errs)
 		return nil, errs
 	}
@@ -148,106 +200,106 @@ func (m *resolver) queryIP(_ context.Context, network, host, uid string, tids ..
 	ip6 = m.undoAlgAndOrNat64(ip6, tid6, uid) // nat64 cannot really be "undone" for ip6!
 	ips := append(ip4, ip6...)
 
-	if log.Debug {
+	if settings.Debug {
 		log.D("ipmapper: host %s => ips (out: %v / in: %d+%d); uid: %s, tids: %s+%s; err4: %v, err6: %v",
-			host, ips, xdns.Len(r4), xdns.Len(r6), uid, tid4, tid6, lerr4, lerr6)
+			host, ips, len(r4), len(r6), uid, tid4, tid6, lerr4, lerr6)
 	}
-
 	return ips, nil
 }
 
-func (m *resolver) queryAny(q *dns.Msg, uid string, tids ...string) (*dns.Msg, error) {
-	if q == nil || len(q.Question) <= 0 {
-		log.W("ipmapper: query: not a dns query; q? %t", q != nil)
-		return nil, ErrQueryParse
+func (m *ipmapper) queryAny2(q []byte, uid string, tids ...string) ([]byte, error) {
+	msg := xdns.AsMsg(q)
+	if msg == nil {
+		log.W("ipmapper: not a dns query sz(%d)", len(q))
+		return nil, errQueryParse
 	}
-	qname := xdns.QName(q)
+	qname := xdns.QName(msg)
 	if len(qname) <= 0 {
 		log.W("ipmapper: query: no qname")
-		return nil, ErrNoHost
+		return nil, errNoHost
 	}
-	qtype := int(xdns.QType(q))
+	qtype := int(xdns.QType(msg))
 	qtypestr := strconv.Itoa(qtype)
 
-	if log.Verbose {
+	if settings.Debug {
 		log.V("ipmapper: lookup: host %s, uid: %v", qname, uid)
 	}
 
 	var v *core.V[answer, string]
 	if len(tids) > 0 {
-		v, _ = m.ba.Do(bakey(qname, qtypestr, tids...), m.lookupon(q, uid, tids...))
+		v, _ = m.ba.Do(key(qname, qtypestr, tids...), m.lookupon(q, tids...))
 	} else if uid != core.UNKNOWN_UID_STR {
-		v, _ = m.ba.Do(bakey(qname, qtypestr, uid), m.lookupfor(q, uid))
+		v, _ = m.ba.Do(key(qname, qtypestr, uid), m.lookupfor(q, uid))
 	} else {
-		v, _ = m.ba.Do(bakey(qname, qtypestr, Default), m.locallookup(q))
+		v, _ = m.ba.Do(key(qname, qtypestr, dnsx.Default), m.locallookup(q))
 	}
 
-	var verr error
-	if v != nil {
-		verr = v.Err
-	}
-
-	// TODO: regiser domain names with ipmap.go for PTR / dns bypass queries
-	if v == nil || v.Val.a == nil || verr != nil {
+	if v == nil || len(v.Val.a) <= 0 || v.Err != nil {
 		log.W("ipmapper: query: noans? %t [err %v] for %s / typ %d; for: %s [on %v]",
-			v == nil, verr, qname, qtype, uid, tids)
-		return nil, core.OneErr(verr, ErrNoAns)
+			v == nil, v.Err, qname, qtype, uid, tids)
+		return nil, core.OneErr(v.Err, errNoAns)
 	}
 
-	a, err := m.undoAlg(v.Val.a, v.Val.tid, uid)
-	return a, err
+	return m.undoAlg(v.Val.a, v.Val.tid, uid)
 }
 
 // lookupfor resolves q given a uid. If uid is protect.SelfUid, the client
-// code (via DNSListener.OnQuery) may or may not choose Default. If uid
+// code (via DNSListener.OnQuery) may or may not choose dnsx.Default. If uid
 // is any other "integer" including "-1" (core.UNKNOWN_UID_STR), the client
 // code is free to choose a transport as it sees fit.
-func (m *resolver) lookupfor(q *dns.Msg, uid string) func() (answer, error) {
+func (m *ipmapper) lookupfor(q []byte, uid string) func() (answer, error) {
 	return func() (answer, error) {
-		a, tid, err := m.lookup(q, uid)
+		a, tid, err := m.r.LookupFor(q, uid)
 		return answer{a, tid, uid}, err
 	}
 }
 
 // lookupon always resolves on one of the chosen tids
-// (if empty, it may or may not use Default;
-// see: transport.go:determineTransport)
-// uid may be protect.MyUid or unknown
-func (m *resolver) lookupon(q *dns.Msg, uid string, tids ...string) func() (answer, error) {
+// (if empty, it may or may not use dnsx.Default;
+// see: dnsx.transport.go:determineTransport)
+func (m *ipmapper) lookupon(q []byte, tids ...string) func() (answer, error) {
 	return func() (answer, error) {
-		a, tid, err := m.lookup(q, uid, tids...)
-		return answer{a, tid, uid}, err
+		a, tid, err := m.r.Lookup(q, tids...)
+		return answer{a, tid, core.UNKNOWN_UID_STR}, err
 	}
 }
 
 // locallookup resolves on dnsx.Default and then on dnsx.System or dnsx.Goos
 // if dnsx.Default fails.
-func (m *resolver) locallookup(q *dns.Msg) func() (answer, error) {
+func (m *ipmapper) locallookup(q []byte) func() (answer, error) {
 	return func() (answer, error) {
-		a, tid, err := m.lookup(q, protect.MyUid)
-		return answer{a, tid, protect.MyUid}, err
+		a, tid, err := m.r.LocalLookup(q)
+		return answer{a, tid, protect.UidSelf}, err
 	}
 }
 
-func (m *resolver) undoAlg(msg *dns.Msg, tid, uid string) (*dns.Msg, error) {
-	gw := m.gateway
-
-	if msg == nil {
-		return nil, nil
+func (m *ipmapper) undoAlg(ans []byte, tid, uid string) ([]byte, error) {
+	gw := m.g
+	if gw == nil {
+		if settings.Debug {
+			log.V("ipmapper: undoAlg: no-op for %s[%s]; no gateway", tid, uid)
+		}
+		return ans, nil
 	}
 
-	qname, possiblyalgips := addrs(msg) // usually only 1 if alg'd
+	msg := &dns.Msg{}
+	if err := msg.Unpack(ans); err != nil {
+		log.W("ipmapper: undoAlg: unpack err %v", err)
+		return ans, nil
+	}
+
+	qname, possiblyalgips := addrs(ans) // usually only 1 if alg'd
 
 	noips := len(possiblyalgips) <= 0
 	is4 := xdns.HasAAnswer(msg)
 	is6 := !is4 && xdns.HasAAAAQuestion(msg)
 
 	if !is4 && !is6 || noips {
-		if log.Verbose {
+		if settings.Debug {
 			log.VV("ipmapper: undoAlg: no a? (%t), aaaa? (%t), ans? (%t); no-op",
 				!is4, !is6, noips)
 		}
-		return msg, nil
+		return ans, nil
 	}
 
 	var realips []netip.Addr
@@ -265,7 +317,7 @@ func (m *resolver) undoAlg(msg *dns.Msg, tid, uid string) (*dns.Msg, error) {
 		logwif(undidAlg)("ipmapper: undoAlg: no algip => realip; return orig (qname: %s / ips: %d / undidAlg? %t); tid? %s[%s]",
 			qname, len(possiblyalgips), undidAlg, tid, uid)
 		// TODO: return error if undidAlg == true?
-		return msg, nil
+		return ans, nil
 	}
 
 	var msgout *dns.Msg
@@ -294,20 +346,20 @@ func (m *resolver) undoAlg(msg *dns.Msg, tid, uid string) (*dns.Msg, error) {
 		qname, realips, xdns.Len(msgout), tid, uid)
 
 	if msgout != nil {
-		return msgout, nil
+		return msgout.Pack()
 	}
-	return msg, nil
+	return ans, nil
 }
 
-func (m *resolver) undoAlgAndOrNat64(ip64 []netip.Addr, tid, uid string) []netip.Addr {
+func (m *ipmapper) undoAlgAndOrNat64(ip64 []netip.Addr, tid, uid string) []netip.Addr {
 	// unlike common.go:undoAlg, we do not filter out ipaddrs
 	// based on dialers.Use4/Use6. This is because the ipmapper
 	// is used for DNS queries, and the dialers are used for
 	// actual connections. The dialers will filter out ipaddrs
 	// based on the dialers.Use4/Use6 settings.
-	gw := m.gateway
+	gw := m.g
 	if gw == nil {
-		if log.Verbose {
+		if settings.Debug {
 			log.V("ipmapper: undoAlg: no-op for %v on %s[%s]; no gateway", ip64, tid, uid)
 		}
 		return ip64
@@ -331,23 +383,24 @@ func (m *resolver) undoAlgAndOrNat64(ip64 []netip.Addr, tid, uid string) []netip
 	return realips // no dups
 }
 
-func bakey(name string, typ string, oth ...string) string {
+func key(name string, typ string, oth ...string) string {
 	if len(oth) <= 0 {
 		return name
 	}
 	return name + ":" + typ + ":" + strings.Join(oth, ":")
 }
 
-func bakey4(name string, oth ...string) string {
-	return bakey(name, "ip4", oth...)
+func key4(name string, oth ...string) string {
+	return key(name, "ip4", oth...)
 }
 
-func bakey6(name string, oth ...string) string {
-	return bakey(name, "ip6", oth...)
+func key6(name string, oth ...string) string {
+	return key(name, "ip6", oth...)
 }
 
 // TODO: handle HTTPS/SVCB
-func addrs(msg *dns.Msg) (qname string, ips []netip.Addr) {
+func addrs(a []byte) (qname string, ips []netip.Addr) {
+	msg := xdns.AsMsg(a)
 	if msg == nil {
 		return
 	}
@@ -371,6 +424,6 @@ func addrs(msg *dns.Msg) (qname string, ips []netip.Addr) {
 	return xdns.QName(msg), ips
 }
 
-func dnsmsg(host string, qtype uint16) (*dns.Msg, error) {
-	return xdns.QuestionMsg(host, qtype)
+func dnsmsg(host string, qtype uint16) ([]byte, error) {
+	return xdns.Question(host, qtype)
 }

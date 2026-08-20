@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -50,15 +49,14 @@ type pipws struct {
 	client     http.Client    // ws client
 	client3    *http.Client   // ws client for ech
 	outbound   *protect.RDial // ws dialer
-	hdl        uint64
-	dhdl       uint64
 	px         ProxyProvider
-	via        atomic.Pointer[core.WeakRef[Proxy]] // hop dialer
-	lastdial   atomic.Int64
+	via        *core.WeakRef[Proxy] // hop dialer
+	viaID      *core.Volatile[string]
+	lastdial   time.Time // last dial time
 
 	done context.CancelFunc // cancel func
 
-	status atomic.Int32 // proxy status: TOK, TKO, END
+	status *core.Volatile[int] // proxy status: TOK, TKO, END
 	opts   *settings.ProxyOptions
 }
 
@@ -76,8 +74,8 @@ func (c *pipwsconn) CloseWrite() error { return c.Close() }
 // dial is aware of proto changes via dialers.SplitDial
 func (t *pipws) dial(network, addr string) (c net.Conn, err error) {
 	who := idstr(t)
-	if ref := t.via.Load(); ref != nil {
-		if v, vok := ref.Get(); vok { // dial via another proxy
+	if usevia(t.viaID) {
+		if v, vok := t.via.Get(); vok { // dial via another proxy
 			who = idstr(v)
 			c, err = v.Dial(network, addr)
 		} else {
@@ -94,7 +92,7 @@ func (t *pipws) dial(network, addr string) (c net.Conn, err error) {
 			c, err = dialers.SplitDial(t.outbound, network, addr)
 		}
 	}
-	defer localDialStatus(&t.status, err)
+	defer localDialStatus(t.status, err)
 	logei(err)("pipws: dial(%s) to %s (via: %s); err? %v", network, addr, who, err)
 	return
 }
@@ -212,16 +210,18 @@ func NewPipWsProxy(ctx context.Context, ctl protect.Controller, px ProxyProvider
 		port:       port,
 		outbound:   protect.MakeNsRDial(RpnWs, ctx, ctl),
 		px:         px,
+		viaID:      core.NewZeroVolatile[string](),
 		token:      po.Auth.User,
 		toksig:     po.Auth.Password,
 		rsasighash: splitpath[2],
+		status:     core.NewVolatile(TUP),
 		done:       done,
 		opts:       po,
 	}
-	t.status.Store(TUP)
-	t.since.Store(now())
-	t.hdl = core.Loc(t)
-	t.dhdl = core.Loc(t.outbound)
+	t.via, err = core.NewWeakRef(t.viafor, viaok)
+	if err != nil {
+		return nil, err
+	}
 
 	_, ok := dialers.New(t.hostname, po.Addrs) // po.Addrs may be nil or empty
 	if !ok {
@@ -259,22 +259,27 @@ func (t *pipws) h2(cfg *tls.Config) *http.Transport {
 	}
 }
 
+func (t *pipws) viafor() *Proxy {
+	return viafor(idstr(t), t.viaID.Load(), t.px)
+}
+
+func (t *pipws) swapVia(new Proxy) Proxy {
+	return swapVia(idstr(t), new, t.viaID, t.via)
+}
+
 // ID implements x.Proxy.
-func (t *pipws) ID() string {
-	return RpnWs
+func (t *pipws) ID() *x.Gostr {
+	return x.StrOf(RpnWs)
 }
 
 // Type implements x.Proxy.
-func (t *pipws) Type() string {
-	return PIPWS
+func (t *pipws) Type() *x.Gostr {
+	return x.StrOf(PIPWS)
 }
 
 // GetAddr implements x.Proxy.
-func (t *pipws) GetAddr() string {
-	if a := t.lastaddr.Load(); a != nil {
-		return *a
-	}
-	return t.hostname + ":" + strconv.Itoa(t.port)
+func (t *pipws) GetAddr() *x.Gostr {
+	return x.StrOf(t.hostname + ":" + strconv.Itoa(t.port))
 }
 
 // Router implements x.Proxy.
@@ -283,38 +288,34 @@ func (t *pipws) Router() x.Router {
 }
 
 // Reaches implements x.Router.
-func (t *pipws) Reaches(hostportOrIPPortCsv string) bool {
-	return Reaches(t, hostportOrIPPortCsv)
-}
-
-// Self implements x.Router.
-func (t *pipws) Self(ip string) bool {
-	if ip == "" {
-		return false
-	}
-	for _, a := range dialers.CachedAddrs(t.hostname) {
-		if a.String() == ip {
-			return true
-		}
-	}
-	return t.GW.Self(ip)
+func (t *pipws) Reaches(hostportOrIPPortCsv *x.Gostr) bool {
+	return Reaches(t, hostportOrIPPortCsv.V())
 }
 
 // Hop implements Proxy.
-func (h *pipws) Hop(via *core.WeakRef[Proxy], dryrun bool) error {
+func (h *pipws) Hop(p Proxy, dryrun bool) error {
+	if p == nil {
+		if !dryrun {
+			old := h.swapVia(nil)
+			log.I("pipws: hop(%s) removed", idhandle(old))
+		}
+		return nil
+	}
+	if p.Status() == END {
+		return errProxyStopped
+	}
+
 	if !dryrun {
-		old := h.via.Swap(via)
-		log.I("pipws: hop %s => %s", refhandle(old), refhandle(via))
+		old := h.swapVia(p)
+		log.I("pipws: hop %s => %s", idhandle(old), idhandle(p))
 	}
 	return nil
 }
 
 // Via implements x.Router.
 func (h *pipws) Via() (x.Proxy, error) {
-	if ref := h.via.Load(); ref != nil {
-		if v, ok := ref.Get(); ok && v != nil {
-			return v, nil
-		}
+	if v := h.via.Load(); v != nil {
+		return v, nil
 	}
 	return nil, errNoHop
 }
@@ -328,12 +329,9 @@ func (t *pipws) Stop() error {
 }
 
 // Status implements Proxy.
-func (t *pipws) Status() int32 {
+func (t *pipws) Status() int {
 	s := t.status.Load()
-	if candial2(s) != nil {
-		return s // paused or ended
-	}
-	if idling(t.lastdial.Load()) {
+	if s != END && idling(t.lastdial) {
 		return TZZ
 	}
 	return s
@@ -347,7 +345,7 @@ func (h *pipws) Pause() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TPU)
+	ok := h.status.Cas(st, TPU)
 	log.I("proxy: pipws: paused? %t", ok)
 	return ok
 }
@@ -360,7 +358,7 @@ func (h *pipws) Resume() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TUP)
+	ok := h.status.Cas(st, TUP)
 	go h.Refresh()
 
 	log.I("proxy: pipws: resumed? %t", ok)
@@ -378,13 +376,13 @@ func (t *pipws) claim(msg string) []string {
 }
 
 // Handle implements Proxy.
-func (t *pipws) Handle() uint64 {
-	return t.hdl
+func (t *pipws) Handle() uintptr {
+	return core.Loc(t)
 }
 
 // DialerHandle implements Proxy.
-func (t *pipws) DialerHandle() uint64 {
-	return t.dhdl
+func (t *pipws) DialerHandle() uintptr {
+	return core.Loc(t.outbound)
 }
 
 // Dial connects to addr via wsconn over this ws proxy
@@ -430,7 +428,7 @@ func (t *pipws) forward(network, addr string) (protect.Conn, error) {
 
 	rurl := u.String()
 	c, res, err := t.wsconn(rurl, msg)
-	t.lastdial.Store(now())
+	t.lastdial = time.Now()
 	if err != nil || res == nil { // nilaway
 		err = core.OneErr(err, errNoProxyConn)
 		core.CloseConn(c)
@@ -448,9 +446,6 @@ func (t *pipws) forward(network, addr string) (protect.Conn, error) {
 	log.D("pipws: duplex %s", rurl)
 
 	t.status.Store(TOK)
-	if a, ok := laddr(c); ok {
-		t.lastaddr.Store(&a)
-	}
 	return c, nil
 }
 
