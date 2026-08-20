@@ -51,12 +51,10 @@ var (
 	errIcmpFirewalled  = errors.New("icmp: firewalled")
 	errUdpFirewalled   = errors.New("udp: firewalled")
 	errUdpInFirewalled = errors.New("udp: ingress firewalled")
-	errTcpInFirewalled = errors.New("tcp: ingress firewalled")
 	errUdpSetupConn    = errors.New("udp: could not create conn")
 	errUdpIncomingDrop = errors.New("udp: at capacity; packet in dropped")
 	errUdpUnconnected  = errors.New("udp: cannot connect")
 	errUdpNoTarget     = errors.New("udp: no target addr")
-	errTcpNoTarget     = errors.New("tcp: no target addr")
 )
 
 const (
@@ -74,7 +72,7 @@ var _ netstack.GUDPConnHandler = (*udpHandler)(nil)
 // `timeout` controls the effective NAT mapping lifetime.
 // `config` is used to bind new external UDP ports.
 // `listener` receives a summary about each UDP binding when it expires.
-func NewUDPHandler(pctx context.Context, resolver dnsx.Resolver, prox ipn.ProxyProvider, listener FlowListener) netstack.GUDPConnHandler {
+func NewUDPHandler(pctx context.Context, resolver dnsx.Resolver, prox ipn.ProxyProvider, listener SocketListener) netstack.GUDPConnHandler {
 	if listener == nil || core.IsNil(listener) {
 		log.W("udp: using noop listener")
 		listener = nooplistener
@@ -90,23 +88,13 @@ func NewUDPHandler(pctx context.Context, resolver dnsx.Resolver, prox ipn.ProxyP
 	return h
 }
 
-// Reset implements netstack.GBaseConnHandler. See baseHandler.Reset; also
-// closes all muxers (EIM/EIF table) so stale muxers bound to the previous
-// stack's conns don't survive into a new stack after a restart.
-func (h *udpHandler) Reset() {
-	h.baseHandler.Reset()
-	if h.mux != nil {
-		h.mux.reset()
-	}
-}
-
 func (h *udpHandler) ReverseProxy(gconn *netstack.GUDPConn, in net.Conn, to, from netip.AddrPort) (ok bool) {
 	fm := h.onInflow(to, from)
 	cid, uid, _, pids := h.judge(fm)
 	smm := udpSummary(cid, uid, to.Addr(), from.Addr())
 
-	if log.Verbose {
-		log.V("udp: %s [%s]: reverse: %s => %s; pids: %v", cid, uid, from, to, pids)
+	if settings.Debug {
+		log.VV("udp: %s [%s]: reverse: %s => %s; pids: %v", cid, uid, from, to, pids)
 	}
 
 	if isAnyBlockPid(pids) {
@@ -138,9 +126,10 @@ func (h *udpHandler) ProxyMux(gconn *netstack.GUDPConn, src, dst netip.AddrPort,
 // Error implements netstack.GUDPConnHandler.
 // Must be called from a goroutine.
 func (h *udpHandler) Error(gconn *netstack.GUDPConn, src, target netip.AddrPort, err error) {
+	defer clos(gconn) // if open
+
 	log.W("udp: error: %v => %v; err %v", src, target, err)
 	if !src.IsValid() || !target.IsValid() {
-		clos(gconn)
 		return
 	}
 	res, undidAlg, realips, domains := h.onFlow(src, target)
@@ -156,16 +145,15 @@ func (h *udpHandler) Error(gconn *netstack.GUDPConn, src, target netip.AddrPort,
 			err = core.JoinErr(errUdpFirewalled, err)
 		}
 		core.Go("udp.stall."+fid, func() {
+			defer clos(gconn)
 			defer h.queueSummary(smm.done(err))
 			secs := h.stall(fid)
 			log.I("udp: error: %s [%s] firewalled from %s => %s (dom: %s / real: %s) for %s; stall? %ds",
 				cid, uid, src, target, domains, realips, uid, secs)
 		})
-		clos(gconn) // close immediately while stall delays queuing summary
 		return
 	}
 
-	clos(gconn)
 	h.queueSummary(smm.done(err))
 }
 
@@ -187,7 +175,6 @@ func (h *udpHandler) proxy(gconn *netstack.GUDPConn, src, dst netip.AddrPort, dm
 		h.queueSummary(smm.done(err)) // no-op if smm is nil
 		return false                  // not ok
 	} else if remote == nil || smm == nil { // dnsOverride or ipn.Block
-		h.queueSummary(smm.done(err)) // no-op if smm is nil
 		// do not close gconn here; it is either
 		// connected (overridden) or disconnected (blocked) already
 		// no summary for dns queries; for blocked connection,
@@ -195,41 +182,25 @@ func (h *udpHandler) proxy(gconn *netstack.GUDPConn, src, dst netip.AddrPort, dm
 		return true // ok
 	}
 
-	h.loopAssoc(smm)
-
 	cid := smm.ID
 	core.Go("udp.forward."+cid, func() {
-		defer h.loopUnassoc(smm)
-		h.flowing(smm)
+		h.listener.PostFlow(smm.postMark())
 		h.forward(gconn, rwext{remote, udptimeout}, smm)
 	})
 	return true // ok
 }
 
 // Connect connects the proxy server; thread-safe.
-func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPort, dmx netstack.DemuxerFn) (pc net.Conn, smm *FlowSummary, err error) {
-	mux := dmx != nil // also disabled for loopback mode, for now
+func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPort, dmx netstack.DemuxerFn) (pc net.Conn, smm *SocketSummary, err error) {
+	mux := dmx != nil
 
 	// flow is alg/nat-aware, do not change target or any addrs
 	res, undidAlg, realips, domains := h.onFlow(src, target)
 
 	h.maybeReplaceDest(res, &target)
 
-	// when target is local nat64 ip6 address, it cannot be really dialed in to
-	// as it only exists within the tunnel to facilitate 6to4 translation; that is
-	// the client uid connects over ip6 to the tunnel, but tunnel de-nats the target
-	// and instead connects over ip4 outside the tunnel, which will go through if
-	// ip4 is available on the underlying network (whereas within the tunnel the uid
-	// would "think" it is using an ip6 enabled network). That is, when proxying client
-	// sources from [fd66:f83a:c650::1]:4956 to target [64:ff9b:1:fffe::22a0:6f91]:80,
-	// it is correct to only dial [34.160.111.145:80] (that is, 22a0:6f91 as ip4) and
-	// not dial both the nat64 target ([64:ff9b:1:fffe::22a0:6f91]:80) and the de-natted
-	// target ([34.160.111.145:80]); indeed, the former wouldn't dial anywhere as it
-	// doesn't exist outside of firestack's tunnel).
-	targetIsLocalNat64 := h.resolver.IsNat64(dnsx.Local464Resolver, target.Addr())
-
-	filtered, excluded, fallingback := h.filterFamilyForDialingWithFailSafe(realips)
-	actualTargets := makeIPPorts(h.resolver, filtered, target, !undidAlg && !targetIsLocalNat64, 0)
+	filtered, _, fallingback := filterFamilyForDialingWithFailSafe(realips)
+	actualTargets := makeIPPorts(filtered, target, !undidAlg, 0)
 	cid, uid, fid, pids := h.judge(res, domains, target.String())
 
 	if len(actualTargets) <= 0 { // unlikely
@@ -290,13 +261,13 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 	// to be marked ipn.Base for queries sent to tunnel's fake DNS addr
 	// and ipn.Exit for anywhere else.
 	if isAnyBasePid(pids) && h.isDNS(target) {
-		if h.dnsOverride(gconn, uid, smm) {
-			// socket/session closed by the overriding dns resolver
+		if h.dnsOverride(gconn, uid) {
+			// SocketSummary is not sent to listener; x.DNSSummary is
 			return nil, nil, nil // connect override, no dst
 		} // else: not a dns query or target is not a dns addr
 	} // else: proxy src to dst
 
-	var pxid string
+	var pxid, rxid, lastselected string
 	var px ipn.Proxy
 	var errs error
 	var selectedTarget netip.AddrPort
@@ -305,7 +276,7 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 	canportfwd := portfwd
 	if mux {
 		if muxpid := h.mux.pid(src); len(muxpid) > 0 && containsPid(pids, muxpid) {
-			if log.Debug {
+			if settings.Debug {
 				log.D("udp: connect: %s [%s] mux: %s => %s using muxed-pid %s; all pids %s",
 					cid, uid, src, target, muxpid, pids)
 			}
@@ -313,25 +284,22 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 		} // else: mxr will dial this conn with a different pid
 	}
 
-	if log.Verbose {
-		log.V("udp: connect: %s [%s] proxying %s => %s [%v]; pids: %s, mux? %t / fwd? %t / localnat64? %t / excluded? %v",
-			cid, uid, src, target, actualTargets, pids, mux, canportfwd, targetIsLocalNat64, excluded)
+	if settings.Debug {
+		log.VV("udp: connect: %s [%s] proxying %s => %s [%v]; pids: %s, mux? %t / fwd? %t",
+			cid, uid, src, target, actualTargets, pids, mux, canportfwd)
 	}
 
 	// note: fake-dns-ips shouldn't be un-nated / un-alg'd
 	for i, dstipp := range actualTargets {
 		rttstart := time.Now()
 
-		px, err = h.prox.ProxyTo(cid, dstipp, "udp", uid, pids)
+		px, err = h.prox.ProxyTo(dstipp, uid, pids)
 
-		// TODO: wait to break circular route after going through all actualTargets?
-		if errors.Is(err, ipn.ErrCircularRoute) {
-			log.I("udp: dial: loop: break1 #%d: %s circular route; dst(%s) for %s; exiting...", i, cid, dstipp, uid)
-			// do not invoke ProxyTo (as it also pins dst to ipn.Exit)
-			// we only want to break "circular loop" just this one time.
-			px, err = h.prox.ProxyFor(ipn.Exit)
+		if px != nil { // last chosen (but not dialed in) proxy
+			pxid = pidstr(px)
+			rxid = ipn.ViaID(px)
+			lastselected = dstipp.Addr().String()
 		}
-
 		selectedTarget = dstipp
 
 		if err != nil || px == nil {
@@ -340,30 +308,12 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 			continue
 		}
 
-		smm.PID = pidstr(px) // last chosen proxy may yet emayrror out
-		smm.RPID = ipn.ViaID(px)
-		smm.Target = selectedTarget.Addr().String() // may be invalid
-
-		if h.loopDetected(smm) {
-			log.I("udp: dial: loop: break2 #%d %s: %s => %v via %s for %s; exiting...", i, cid, src, selectedTarget, smm.PID, uid)
-			px, err = h.prox.ProxyTo(cid+"/loop", dstipp, "udp", uid, onlyExitPid)
-			smm.PID = ipn.Exit // last chosen proxy may yet emayrror out
-			smm.RPID = ""
-		}
-
-		if px == nil || err != nil { // unlikely
-			log.E("udp: connect: #%d: %s [%s] failed to get proxy from %s: %v", i, cid, uid, smm.PID, err)
-			errs = err
-			continue
-		}
-
-		pxid = smm.PID
 		canportfwd = portfwd && ipn.Remote(pxid)
 
 		if mux { // mux is not supported by all proxies (few like Exit, Base, WG support it)
 			pc, err = h.mux.associate(cid, pxid, uid, src, selectedTarget, px.Dialer().Announce, vendor(dmx), canportfwd)
 		} else {
-			if log.Verbose {
+			if settings.Debug {
 				log.VV("udp: connect: #%d: attempt: %s [%s] proxy(%s) to dst(%s); mux? %t / fwd? %t",
 					i, cid, uid, pxid, selectedTarget, mux, canportfwd)
 			}
@@ -388,6 +338,12 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 		if end > retryTimeout {
 			break
 		}
+	}
+
+	if len(pxid) > 0 { // last chosen proxy which may have errored
+		smm.PID = pxid
+		smm.RPID = rxid
+		smm.Target = lastselected // may be invalid
 	}
 
 	if !selectedTarget.IsValid() {

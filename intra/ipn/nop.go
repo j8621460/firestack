@@ -8,10 +8,7 @@ package ipn
 
 import (
 	"errors"
-	"net"
 	"net/netip"
-	"slices"
-	"sync/atomic"
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
@@ -22,7 +19,6 @@ import (
 var (
 	errProbeNotSupported    = errors.New("proxy: probe not supported")
 	errAnnounceNotSupported = errors.New("proxy: announce not supported")
-	errAcceptNotSupported   = errors.New("proxy: accept not supported")
 )
 
 const nodns = "" // no DNS
@@ -35,15 +31,8 @@ type GWNoVia struct {
 
 // GW is a no-op/stub gateway that is either dualstack or not and has dummy stats.
 type GW struct {
-	nov4, nov6 bool                   // is dualstack
-	stats      x.RouterStats          // zero stats
-	since      atomic.Int64           // uptime in unix millis
-	lastaddr   atomic.Pointer[string] // last dialed address (ip:port)
-}
-
-// setSince resets the since time for this proxy (useful in re-add/update scenarios).
-func (w *GW) setSince(unixmillis int64) {
-	w.since.Store(unixmillis)
+	nov4, nov6 bool          // is dualstack
+	stats      x.RouterStats // zero stats
 }
 
 var _ x.Router = (*GWNoVia)(nil)
@@ -62,26 +51,12 @@ func (w *GW) Stat() *x.RouterStats {
 	if !w.nov4 || !w.nov6 {
 		w.stats.LastOK = now() // always OK
 	}
-	w.stats.Since = w.since.Load()
 	return &w.stats
 }
 
-// Self implements x.Router.
-func (w *GW) Self(ip string) bool {
-	if len(ip) <= 0 {
-		return false
-	}
-	if a := w.lastaddr.Load(); a != nil {
-		if host, _, err := net.SplitHostPort(*a); err == nil && host == ip {
-			return true
-		}
-	}
-	return false
-}
-
 // Contains implements x.Router.
-func (w *GW) Contains(who, ippOrCidr string) bool {
-	prefix, err := core.IP2Cidr2(ippOrCidr)
+func (w *GW) Contains(ippOrCidr *x.Gostr) bool {
+	prefix, err := core.IP2Cidr2(ippOrCidr.V())
 	if err != nil {
 		return false
 	}
@@ -93,18 +68,23 @@ func (w *GW) ok4(ip netip.Addr) bool { return w.IP4() && ip.IsValid() && ip.Is4(
 func (w *GW) ok6(ip netip.Addr) bool { return w.IP6() && ip.IsValid() && ip.Is6() }
 
 // Reaches implements Router.
-func (w *GW) Reaches(hostportOrIPPortCsvStr string) bool {
-	hostportOrIPPortCsv := hostportOrIPPortCsvStr
+func (w *GW) Reaches(hostportOrIPPortCsvStr *x.Gostr) bool {
+	hostportOrIPPortCsv := hostportOrIPPortCsvStr.V()
 
 	if len(hostportOrIPPortCsv) <= 0 {
 		return true
 	}
 	ips := dialers.For(hostportOrIPPortCsv)
-	return slices.ContainsFunc(ips, w.ok)
+	for _, ip := range ips {
+		if w.ok(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // ProxyNoGateway is a Router that routes nothing.
-var ProxyNoGateway = &GWNoVia{GW: GW{nov4: true, nov6: true}}
+var ProxyNoGateway = GWNoVia{GW: GW{nov4: true, nov6: true}}
 
 // ProtoAgnostic is a proxy that does not care about protocol changes.
 type ProtoAgnostic struct{}
@@ -141,7 +121,7 @@ func (NoFwd) Announce(network, local string) (protect.PacketConn, error) {
 
 // Accept implements Proxy.
 func (NoFwd) Accept(network, local string) (protect.Listener, error) {
-	return nil, errAcceptNotSupported
+	return nil, errAnnounceNotSupported
 }
 
 // Probe implements Proxy.
@@ -151,14 +131,14 @@ func (NoFwd) Probe(string, string) (protect.PacketConn, error) {
 
 type NoDNS struct{}
 
-func (NoDNS) DNS() string {
-	return nodns
+func (NoDNS) DNS() *x.Gostr {
+	return x.StrOf(nodns)
 }
 
 type NoVia struct{}
 
-func (NoVia) Via() (x.Proxy, error)                { return nil, errNop }
-func (NoVia) Hop(*core.WeakRef[Proxy], bool) error { return errNop }
+func (NoVia) Via() (x.Proxy, error) { return nil, errNop }
+func (NoVia) Hop(Proxy, bool) error { return errNop }
 
 var errNop = errors.New("proxy: nop")
 
@@ -175,17 +155,16 @@ type NoProxy struct {
 	GWNoVia
 }
 
-func (*NoProxy) Handle() uint64                                        { return core.Nobody }
-func (*NoProxy) DialerHandle() uint64                                  { return core.Nobody }
-func (*NoProxy) ID() string                                            { return "" }
-func (*NoProxy) Type() string                                          { return "" }
-func (*NoProxy) Router() x.Router                                      { return nil }
-func (*NoProxy) Reaches(string) bool                                   { return false }
-func (*NoProxy) Self(string) bool                                      { return false }
-func (*NoProxy) Dial(string, string) (protect.Conn, error)             { return nil, errNop }
-func (*NoProxy) DialBind(string, string, string) (protect.Conn, error) { return nil, errNop }
-func (*NoProxy) Dialer() protect.RDialer                               { return nil }
-func (*NoProxy) Status() int32                                         { return 0 }
-func (*NoProxy) GetAddr() string                                       { return "" }
-func (*NoProxy) Stop() error                                           { return nil }
-func (*NoProxy) Client() x.Client                                      { return nil }
+func (NoProxy) Handle() uintptr                                       { return core.Nobody }
+func (NoProxy) DialerHandle() uintptr                                 { return core.Nobody }
+func (NoProxy) ID() *x.Gostr                                          { return nil }
+func (NoProxy) Type() *x.Gostr                                        { return nil }
+func (NoProxy) Router() x.Router                                      { return nil }
+func (NoProxy) Reaches(*x.Gostr) bool                                 { return false }
+func (NoProxy) Dial(string, string) (protect.Conn, error)             { return nil, errNop }
+func (NoProxy) DialBind(string, string, string) (protect.Conn, error) { return nil, errNop }
+func (NoProxy) Dialer() protect.RDialer                               { return nil }
+func (NoProxy) Status() int                                           { return 0 }
+func (NoProxy) GetAddr() *x.Gostr                                     { return nil }
+func (NoProxy) Stop() error                                           { return nil }
+func (NoProxy) Client() x.Client                                      { return nil }

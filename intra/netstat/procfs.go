@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/celzero/firestack/intra/core"
@@ -74,16 +73,14 @@ type ProcNetEntry struct {
 }
 
 type ProcNetCache struct {
-	pool        *sync.Map     // hash(ProcNetEntry.String()), *ProcNetEntry{}
-	lastcleanup *atomic.Int64 // unix millis, accessed atomically
+	pool        *sync.Map // string, *ProcNetEntry{}
+	lastcleanup time.Time
 }
 
 func NewProcNetCache() ProcNetCache {
-	c := &atomic.Int64{}
-	c.Store(time.Now().UnixMilli())
 	return ProcNetCache{
 		pool:        new(sync.Map),
-		lastcleanup: c,
+		lastcleanup: time.Now(),
 	}
 }
 
@@ -105,16 +102,6 @@ func (p *ProcNetEntry) String() string {
 	return p.Protocol + p.SrcIP.String() + strconv.Itoa(p.SrcPort) + p.DstIP.String() + strconv.Itoa(p.DstPort)
 }
 
-// cacheKey returns the key used for pool lookups.
-// Note: UID and INode are intentionally excluded because lookups
-// are performed by 5-tuple (protocol, src, sport, dst, dport) —
-// the whole purpose is to discover UID/INode from the 5-tuple.
-// When two /proc/net entries share the same 5-tuple (e.g. SO_REUSEPORT
-// UDP sockets), the first entry parsed wins.
-func (p *ProcNetEntry) cacheKey() uint64 {
-	return core.HashStr(p.String())
-}
-
 func (p *ProcNetEntry) Same(q *ProcNetEntry) bool {
 	if p == nil || q == nil {
 		return false
@@ -130,10 +117,10 @@ func (p *ProcNetEntry) Same(q *ProcNetEntry) bool {
 	dst1 := p.DstIP.Unmap()
 	dst2 := q.DstIP.Unmap()
 
-	if src1.Is6() != src2.Is6() {
+	if src1.Is6() && !src2.Is6() {
 		return false
 	}
-	if dst1.Is6() != dst2.Is6() {
+	if dst1.Is6() && !dst2.Is6() {
 		return false
 	}
 
@@ -142,29 +129,17 @@ func (p *ProcNetEntry) Same(q *ProcNetEntry) bool {
 		zeroip = zeroip6
 	}
 
-	// Skip IP comparison only if ONE side is unspecified (listening socket).
-	// If BOTH are unspecified, they're different listeners and should not match.
 	// github.com/M66B/NetGuard/blob/1fe3a04ae/app/src/main/jni/netguard/ip.c#L393
 	skipSrcIP := false
 	skipDstIP := false
 	skipDstPort := false
-	src1Zero := zeroip.Compare(src1) == 0
-	src2Zero := zeroip.Compare(src2) == 0
-	dst1Zero := zeroip.Compare(dst1) == 0
-	dst2Zero := zeroip.Compare(dst2) == 0
-
-	if src1Zero != src2Zero {
-		// Exactly one is zero (e.g., listening socket vs established connection)
+	if zeroip.Compare(src1) == 0 || zeroip.Compare(src2) == 0 {
 		skipSrcIP = true
 	}
-	if dst1Zero != dst2Zero {
+	if zeroip.Compare(dst1) == 0 || zeroip.Compare(dst2) == 0 {
 		skipDstIP = true
 	}
-	// Skip dst port comparison only if the query has port 0 (wildcard lookup)
-	// Don't skip if both have port 0 - that's not a valid match
-	if zeroPort == p.DstPort && zeroPort != q.DstPort {
-		skipDstPort = true
-	} else if zeroPort == q.DstPort && zeroPort != p.DstPort {
+	if zeroPort == p.DstPort || zeroPort == q.DstPort {
 		skipDstPort = true
 	}
 
@@ -194,67 +169,56 @@ func hexToInt(h string) int {
 	return int(d)
 }
 
-// hexToInt4 parses a 32-char hex string (IPv6) into four uint32 values.
-// The kernel stores IPv6 as 4 x uint32 in little-endian format.
-// Returns (w0, w1, w2, w3) corresponding to bytes 0-3, 4-7, 8-11, 12-15.
-func hexToInt4(h string) (w0 uint32, w1 uint32, w2 uint32, w3 uint32) {
-	l := len(h)
-
-	if l >= 16 {
-		w, err := strconv.ParseUint(h[0:8], 16, 32)
+func hexToInt2(h string) (uint, uint) {
+	if len(h) > 16 {
+		d, err := strconv.ParseUint(h[:16], 16, 64)
 		if err != nil {
-			log.E("hexToInt4: w0 parse failed: %v", err)
-			return 0, 0, 0, 0
+			log.E("Error while parsing %s to int: %s", h[:16], err)
 		}
-		w0 = uint32(w)
-		w, err = strconv.ParseUint(h[8:16], 16, 32)
+		d2, err := strconv.ParseUint(h[16:], 16, 64)
 		if err != nil {
-			log.E("hexToInt4: w1 parse failed: %v", err)
-			return 0, 0, 0, 0
+			log.E("Error while parsing %s to int: %s", h[16:], err)
 		}
-		w1 = uint32(w)
-
-		if l <= 32 {
-			w, err := strconv.ParseUint(h[16:24], 16, 32)
-			if err != nil {
-				log.E("hexToInt4: w2 parse failed: %v", err)
-				return 0, 0, 0, 0
-			}
-			w2 = uint32(w)
-			w, err = strconv.ParseUint(h[24:32], 16, 32)
-			if err != nil {
-				log.E("hexToInt4: w3 parse failed: %v", err)
-				return 0, 0, 0, 0
-			}
-			w3 = uint32(w)
-		}
+		return uint(d), uint(d2)
 	}
-	return
+	d, err := strconv.ParseUint(h, 16, 64)
+	if err != nil {
+		log.E("Error while parsing %s to int: %s", h[:16], err)
+	}
+	return uint(d), 0
+
 }
 
-// hexToIP converts a hex string from /proc/net/* to a netip.Addr.
-// The kernel stores addresses in little-endian format:
-// - IPv4: 8 hex chars (1 uint32)
-// - IPv6: 32 hex chars (4 uint32 words)
 func hexToIP(h string) netip.Addr {
-	if len(h) == 32 {
-		// IPv6 address: parse as 4 x uint32
-		w0, w1, w2, w3 := hexToInt4(h)
-		ip := make(net.IP, 16)
-		binary.LittleEndian.PutUint32(ip[0:4], w0)
-		binary.LittleEndian.PutUint32(ip[4:8], w1)
-		binary.LittleEndian.PutUint32(ip[8:12], w2)
-		binary.LittleEndian.PutUint32(ip[12:16], w3)
-		return toUnmappedAddr(ip)
+	hi, lo := hexToInt2(h)
+	var ip net.IP
+	if lo != 0 {
+		lomsb := uint32(lo >> 32)
+		himsb := uint32(hi >> 32)
+
+		// see: netip.Unmap
+		// stackoverflow.com/questions/22751035
+		// hi: 0000 0000 0000 0000 0000 0000 0000 0000
+		// lo: 0000 0000 0000 0000 wwww xxxx yyyy zzzz
+		if hi == 0 && lomsb == 0 {
+			ip = make(net.IP, 4) // v4in6
+			binary.LittleEndian.PutUint32(ip, uint32(lo))
+		} else {
+			ip = make(net.IP, 16)
+			// ip addresses are stored in network byte order
+			binary.LittleEndian.PutUint32(ip, himsb)
+			binary.LittleEndian.PutUint32(ip[4:], uint32(hi))
+			// if v4in6: github.com/golang/go/blob/2bed2797/src/net/ip.go#L195-L196
+			// mark: 0000 0000 0000 0000 1111 1111 1111 1111
+			// mark := uint32(0xffff)
+			// binary.BigEndian.PutUint32(ip[8:], mark)
+			binary.LittleEndian.PutUint32(ip[8:], lomsb)
+			binary.LittleEndian.PutUint32(ip[12:], uint32(lo))
+		}
+	} else {
+		ip = make(net.IP, 4)
+		binary.LittleEndian.PutUint32(ip, uint32(hi))
 	}
-	// IPv4 address
-	v, err := strconv.ParseUint(h, 16, 32)
-	if err != nil {
-		log.E("hexToIP: IPv4 parse failed: %v", err)
-		return netip.Addr{}
-	}
-	ip := make(net.IP, 4)
-	binary.LittleEndian.PutUint32(ip, uint32(v))
 	return toUnmappedAddr(ip)
 }
 
@@ -308,12 +272,10 @@ func ParseProcNet(protocol string) ([]ProcNetEntry, error) {
 func cleanupPool() {
 	defer core.Recover(core.Exit11, "procfs.cleanupPool")
 
-	lastCleanupMs := cache.lastcleanup.Load()
-	nowMs := time.Now().UnixMilli()
-	if nowMs-lastCleanupMs <= cachettl {
+	if time.Since(cache.lastcleanup).Milliseconds() <= cachettl {
 		return
 	}
-	cache.lastcleanup.Store(nowMs)
+	cache.lastcleanup = time.Now()
 
 	cache.pool.Range(func(k, v any) bool {
 		if e, ok := v.(*ProcNetEntry); ok {
@@ -343,7 +305,7 @@ func deleteProcNetEntryFromPool(p *ProcNetEntry) {
 		return
 	}
 
-	cache.pool.Delete(p.cacheKey())
+	cache.pool.Delete(p.String())
 }
 
 func addProcNetEntryToPool(p *ProcNetEntry) {
@@ -351,7 +313,7 @@ func addProcNetEntryToPool(p *ProcNetEntry) {
 		return
 	}
 
-	cache.pool.Store(p.cacheKey(), p)
+	cache.pool.Store(p.String(), p)
 }
 
 func getProcNetEntryFromPool(p *ProcNetEntry) *ProcNetEntry {
@@ -359,7 +321,7 @@ func getProcNetEntryFromPool(p *ProcNetEntry) *ProcNetEntry {
 		return nil
 	}
 
-	if v, ok := cache.pool.Load(p.cacheKey()); !ok {
+	if v, ok := cache.pool.Load(p.String()); !ok {
 		return nil
 	} else if e, ok := v.(*ProcNetEntry); !ok {
 		return nil

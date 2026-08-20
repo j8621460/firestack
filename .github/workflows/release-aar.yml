@@ -1,0 +1,157 @@
+# Builds firestack.aar / firestack-debug.aar and publishes them to a GitHub
+# Release, so consumers can depend on a release asset instead of JitPack.
+#
+# Why this exists: JitPack builds this repo per-commit and rate-limits (HTTP 429)
+# under load, which breaks downstream builds at dependency-resolution time. A
+# release asset is a plain HTTPS download with no build step and no rate limit.
+#
+# The build itself is exactly what jitpack.yml does -- ./make-aar -- so output
+# should be byte-comparable to a JitPack build of the same commit, modulo
+# timestamps. See BUILD.md for running it by hand.
+name: 📦 Release AAR
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'aar-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create for this release (e.g. aar-2026.08.20)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 🏗️ Build and publish aar
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # consumed by make-aar; see the defaults at the top of that script
+      FOUT: firestack.aar
+      FOUTDBG: firestack-debug.aar
+      # Pin the NDK. make-aar otherwise lets gomobile pick "the latest NDK found
+      # by walking $ANDROID_HOME/ndk", which silently changes what we ship when
+      # the runner image updates. This is the version jitpack.yml pins.
+      NDKVER: "28.2.13676358"
+      SDKVER: "36"
+
+    steps:
+      - name: 🥏 Checkout
+        uses: actions/checkout@v6
+
+      # make-aar's "nogo" mode expects go to already be on PATH. Using
+      # setup-go rather than make-aar's own curl-from-go.dev keeps the
+      # toolchain cached between runs.
+      - name: 🐼 Setup go1.26+
+        uses: actions/setup-go@v6
+        with:
+          go-version: '>=1.26'
+          check-latest: true
+
+      - name: 🤖 Install NDK ${{ env.NDKVER }}
+        run: |
+          set -eux
+          yes | "$ANDROID_HOME"/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null
+          "$ANDROID_HOME"/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-${SDKVER}" \
+            "build-tools;${SDKVER}.0.0" \
+            "ndk;${NDKVER}"
+        shell: bash
+
+      - name: 🏗️ Build aar
+        id: build
+        run: |
+          set -eux
+          # "nogo": go is already installed above, so make-aar must not fetch it.
+          # "debug": also emit firestack-debug.aar alongside the stripped one.
+          ./make-aar nogo debug
+          ls -l firestack.aar firestack-debug.aar
+        shell: bash
+
+      - name: 🔎 Verify output
+        run: |
+          set -eu
+          for f in firestack.aar firestack-debug.aar; do
+            test -s "$f" || { echo "::error::$f missing or empty"; exit 1; }
+          done
+          # An aar is a zip; a truncated or half-written one will fail here
+          # rather than at the consumer's Gradle sync.
+          unzip -t firestack.aar > /dev/null || { echo "::error::firestack.aar is not a valid archive"; exit 1; }
+          # classes.jar is what Gradle actually consumes -- its absence means
+          # gomobile produced a shell with no bytecode in it.
+          unzip -l firestack.aar | grep -q 'classes.jar' || { echo "::error::firestack.aar has no classes.jar"; exit 1; }
+          sha256sum firestack.aar firestack-debug.aar | tee SHA256SUMS.txt
+        shell: bash
+
+      # Keep the artifact even when the release step is skipped or fails, so a
+      # bad tag does not mean rebuilding from scratch.
+      - name: 🚀 Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestack-aar-${{ github.sha }}
+          path: |
+            firestack.aar
+            firestack-debug.aar
+            SHA256SUMS.txt
+            build/intra/tun2socks-sources.jar
+          if-no-files-found: error
+
+      - name: 🏷️ Resolve tag
+        id: tag
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "pre=${{ inputs.prerelease }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "pre=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: 📦 Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: firestack ${{ steps.tag.outputs.name }}
+          prerelease: ${{ steps.tag.outputs.pre }}
+          generate_release_notes: true
+          body: |
+            Built from `${{ github.sha }}` by `./make-aar nogo debug`.
+
+            This branch is pinned to the pre-`n2` API: it still exports
+            `Gostr` / `Gobyte` and the 3-argument `OnQuery`, which upstream
+            `n2` removed.
+
+            | asset | use |
+            |---|---|
+            | `firestack.aar` | stripped, for release builds |
+            | `firestack-debug.aar` | with debug symbols |
+            | `tun2socks-sources.jar` | sources, for IDE navigation |
+            | `SHA256SUMS.txt` | checksums for the two aars |
+
+            Consuming it directly, without JitPack:
+
+            ```groovy
+            dependencies {
+                implementation files('libs/firestack.aar')
+            }
+            ```
+
+            NDK `${{ env.NDKVER }}`, SDK `${{ env.SDKVER }}`. See `BUILD.md`.
+          files: |
+            firestack.aar
+            firestack-debug.aar
+            SHA256SUMS.txt
+            build/intra/tun2socks-sources.jar

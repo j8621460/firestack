@@ -21,8 +21,6 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
-
-	"github.com/miekg/dns"
 )
 
 func TestGetTwice(t *testing.T) {
@@ -166,11 +164,27 @@ type fakeResolver struct {
 	*net.Resolver
 }
 
-func (r fakeResolver) Lookup(*dns.Msg, string, ...string) (*dns.Msg, error) {
+func (r fakeResolver) LocalLookup([]byte) ([]byte, error) {
 	return nil, errors.New("not implemented")
 }
 
-func (r fakeResolver) LookupNetIP(_ context.Context, _, _, _ string, _ ...string) ([]netip.Addr, error) {
+func (r fakeResolver) Lookup([]byte, string, ...string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupFor([]byte, string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupNetIP(_ context.Context, _, _ string) ([]netip.Addr, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupNetIPFor(_ context.Context, _, _, _ string) ([]netip.Addr, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupNetIPOn(_ context.Context, _, _ string, _ ...string) ([]netip.Addr, error) {
 	return nil, errors.New("not implemented")
 }
 

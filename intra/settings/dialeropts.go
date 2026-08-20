@@ -9,10 +9,7 @@ package settings
 import (
 	"strconv"
 	"strings"
-	"sync/atomic"
 )
-
-const defaultBufferSize = 2 * 1024 * 1024 // 1 MiB
 
 // DialerOpts define dialer options.
 type DialerOpts struct {
@@ -27,10 +24,6 @@ type DialerOpts struct {
 	ReadTimeoutSec int32
 	// Write timeout for outgoing tcp & udp connections.
 	WriteTimeoutSec int32
-	// Write buffer sizes for TCP and UDP
-	WriteBufferSize int32
-	// Read buffer sizes for TCP and UDP
-	ReadBufferSize int32
 }
 
 func (d DialerOpts) String() string {
@@ -62,12 +55,6 @@ func (d DialerOpts) String() string {
 			return "Unknown"
 		}
 	}()
-	sz := func() string {
-		if d.ReadBufferSize != d.WriteBufferSize {
-			return "r: " + strconv.Itoa(int(d.ReadBufferSize)) + "b w: " + strconv.Itoa(int(d.WriteBufferSize)) + "b"
-		}
-		return "rw: " + strconv.Itoa(int(d.ReadBufferSize)) + "b"
-	}()
 	ka := func() string {
 		if d.LowerKeepAlive {
 			return "LowerKeepAlive"
@@ -80,7 +67,7 @@ func (d DialerOpts) String() string {
 			"s"
 	}()
 
-	return strings.Join([]string{s, r, sz, ka, tmo}, ",")
+	return strings.Join([]string{s, r, ka, tmo}, ",")
 }
 
 // Dial strategies
@@ -108,15 +95,11 @@ const (
 	RetryNever
 )
 
-var dialerOpts atomic.Pointer[DialerOpts]
-
-func init() {
-	dialerOpts.Store(&DialerOpts{})
-}
+var dialerOpts = &DialerOpts{}
 
 // SetDialerOpts sets the dialer options to use.
-func SetDialerOpts(strat, retry, sizeBytes, timeoutsec int32, keepalive bool) bool {
-	s := new(DialerOpts)
+func SetDialerOpts(strat, retry, timeoutsec int32, keepalive bool) bool {
+	s := dialerOpts
 	ok := true
 	switch strat {
 	case SplitTCP, SplitTCPOrTLS, SplitDesync, SplitAuto, SplitNever:
@@ -138,13 +121,10 @@ func SetDialerOpts(strat, retry, sizeBytes, timeoutsec int32, keepalive bool) bo
 	}
 	s.ReadTimeoutSec = timeoutsec
 	s.WriteTimeoutSec = timeoutsec
-	s.ReadBufferSize = min(sizeBytes, defaultBufferSize)
-	s.WriteBufferSize = min(sizeBytes, defaultBufferSize)
-	dialerOpts.Store(s)
 	return ok
 }
 
 // GetDialerOpts returns current dialer options.
 func GetDialerOpts() DialerOpts {
-	return *dialerOpts.Load()
+	return *dialerOpts
 }

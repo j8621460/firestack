@@ -9,43 +9,47 @@ package dialers
 import (
 	"context"
 	"net/netip"
-	"time"
+	"net/url"
 
 	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/protect"
-	"github.com/celzero/firestack/intra/protect/ipmap"
 	"github.com/celzero/firestack/intra/xdns"
 	"github.com/miekg/dns"
 )
 
-// ResolveFor resolves nom to IPs,  bypassing cache, using transport
-// designated for given uid. If resolution fails, entries from the
-// cache are returned, if any.
-func ResolveFor(m ipmap.IPMapper, nom string, uid string, tids ...string) ([]netip.Addr, error) {
-	// both lookups may return addrs = nil, err = nil
-	// (see: ipmapper.go:lookup and protect.NeverResolve)
+// ResolveFor resolves nom to IPs using transport designated for given uid.
+func ResolveFor(nom string, uid string) ([]netip.Addr, error) {
 	// ipm.LookupNetIP itself has a short-term cache (ipmapper.go:battl)
 	// and since TIDs are specified, the ipmap cache is not used.
-	addrs, err := m.LookupNetIP(context.Background(), "ip", nom, uid, tids...)
+	return ipm.LookupNetIPFor(context.Background(), "ip", nom, uid)
+}
+
+// Resolve resolves hostname to IP addresses, bypassing cache.
+// If resolution fails, entries from the cache are returned, if any.
+func Resolve(hostname string, tids ...string) (addrs []netip.Addr, err error) {
+	ctx := context.Background()
+	// both lookups may return addrs = nil, err = nil
+	// (see: ipmapper.go:queryIP2 and protect.NeverResolve)
+	// ipm.LookupNetIPxxx itself has a short-term cache (ipmapper.go:battl)
+	addrs, err = ipm.LookupNetIPOn(ctx, "ip", hostname, tids...)
 
 	if len(addrs) <= 0 { // check cache
-		if addrs = CachedAddrs(nom); len(addrs) > 0 {
+		if addrs = CachedAddrs(hostname); len(addrs) > 0 {
 			return addrs, nil
 		} // else: no cached addrs
 		// even if ipmapper lookups return no addrs, raw ipset
 		// may have seed addrs; which when empty, error out.
 		err = core.OneErr(err, errNoIps)
-	} else if uid == protect.MyUid {
-		// cache for dialers to use; only for MyUid, not for other uids
-		cache(nom, addrs)
 	}
 	return addrs, err
 }
 
-// Resolve is like ResolverFor but with uid = protect.MyUid.
-// See: [For] to get cached addrs and optionally resolve, and [CachedAddrs] to only get cached addrs.
-func Resolve(hostname string, tids ...string) (addrs []netip.Addr, err error) {
-	return ResolveFor(ipm, hostname, protect.MyUid, tids...)
+func ResolveForUrl(s string) []netip.Addr {
+	u, err := url.Parse(s) // works if s is mere hostname; ex: example.com
+	if err != nil {
+		return For(s) // fallback on hostOrIP
+	}
+	return For(u.Hostname())
 }
 
 // SampleHosts returns a slice of random hosts, of size n, for the given ipver.
@@ -63,22 +67,17 @@ func SampleIPs(n uint8, ipver string) []netip.Addr {
 // ECH returns the ECH config, if any, for the given hostname.
 // The query is resolved using IPMapper's default resolver.
 func ECH(hostname string) ([]byte, error) {
-	q, err := xdns.QuestionMsg(hostname, dns.TypeHTTPS)
+	q, err := xdns.Question(hostname, dns.TypeHTTPS)
 	if err != nil {
 		return nil, err
 	}
-	// bound the lookup: a slow or absent resolver must not stall callers
-	// (transport constructors & first-query paths) for the full resolver
-	// timeout; most public resolvers publish no ECH config anyway.
-	const echTimeout = 25 * time.Second
-	ans, ok := core.Grx("dialers.ech."+hostname, func(_ context.Context) (*dns.Msg, error) {
-		return ipm.Lookup(q, protect.MyUid)
-	}, echTimeout)
-	if !ok {
-		return nil, errEchQTimeout
+	res, err := ipm.LocalLookup(q)
+	if err != nil {
+		return nil, err
 	}
-	if ans == nil {
-		return nil, errNoEch
+	ans := &dns.Msg{}
+	if err = ans.Unpack(res); err != nil {
+		return nil, err
 	}
 	for _, a := range ans.Answer {
 		if rr, ok := a.(*dns.HTTPS); ok {
@@ -94,23 +93,44 @@ func ECH(hostname string) ([]byte, error) {
 	return nil, errNoEch
 }
 
-// Query is like [QueryFor] but with uid set to [protect.MyUid].
-// m is the IPMapper implementation to query with, never nil.
-func Query(m ipmap.IPMapper, msg *dns.Msg, tids ...string) (*dns.Msg, error) {
-	a, err := QueryFor(m, msg, protect.MyUid, tids...)
-	if err == nil {
-		cache2(a)
+// Query sends a DNS query to the Default DNS and
+// returns the answer.
+func Query(msg *dns.Msg, tids ...string) (*dns.Msg, error) {
+	q, err := msg.Pack()
+	if err != nil {
+		return nil, err
 	}
-	return a, err
+
+	r, err := ipm.Lookup(q, protect.UidSelf, tids...)
+	if err != nil {
+		return nil, err
+	}
+
+	ans := &dns.Msg{}
+	if err = ans.Unpack(r); err != nil {
+		return nil, err
+	}
+	return ans, nil
 }
 
-// QueryFor forward a DNS request for tid (if set) attributed to uid,
-// or to transport chosen for uid, which may be core.UNKNOWN_UID_STR.
-// QueryFor allows specifying both uid and tids. QueryFor, unlike
-// ResolveFor is not just for A/AAAA records but for any record type.
-// It bypasses the cache and returns the answer from tid or
-// from transport designated for uid.
-// m is the IPMapper implementation to query with, never nil.
-func QueryFor(m ipmap.IPMapper, msg *dns.Msg, uid string, tids ...string) (*dns.Msg, error) {
-	return m.Lookup(msg, uid, tids...)
+// QueryFor forward a DNS request for uid (if set)
+// or to chosen transport, tid (if uid is not set).
+func QueryFor(msg *dns.Msg, uid, tid string) (*dns.Msg, error) {
+	q, qerr := msg.Pack()
+	if qerr != nil {
+		return nil, qerr
+	}
+
+	// uid may be core.UNKNOWN_UID_STR
+	r, rerr := ipm.Lookup(q, uid, tid)
+
+	if rerr != nil {
+		return nil, rerr
+	}
+
+	ans := &dns.Msg{}
+	if aerr := ans.Unpack(r); aerr != nil {
+		return nil, aerr
+	}
+	return ans, nil
 }

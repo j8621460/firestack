@@ -202,9 +202,9 @@ func dialtls[D rdials](d D, cfg *tls.Config, network, local, remote string, how 
 	}
 	if err != nil {
 		clos(tlsconn)
-		return nil, err
+		tlsconn = nil
 	}
-	return tlsconn, nil
+	return tlsconn, err
 }
 
 func tlsHello(c net.Conn, cfg *tls.Config, addr string) (*tls.Conn, error) {

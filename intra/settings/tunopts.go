@@ -10,8 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-
-	"github.com/celzero/firestack/intra/core"
 )
 
 // TODO: These modes could be covered by bit-flags instead.
@@ -43,11 +41,7 @@ const (
 	// PtModeForce64 enforces 6to4 protocol translation.
 	PtModeForce64 int32 = 1
 	// Android implements 464Xlat out-of-the-box, so this zero userspace impl
-	PtModeNone int32 = 2
-	// PtModeForce46 enforces 4 via 6 protocol translation.
-	PtModeForce46 int32 = 3
-	// PtModeForce enforces both PtModeForce64 or PtModeForce46.
-	PtModeForce int32 = 4
+	PtModeNo46 int32 = 2
 )
 
 // Converts a given DNS/Block/Pt mode to its string representation.
@@ -81,12 +75,8 @@ func Mode2String(typ string, mode int32) string {
 				return "auto"
 			case PtModeForce64:
 				return "force64"
-			case PtModeForce46:
-				return "force46"
-			case PtModeForce:
-				return "force"
-			case PtModeNone:
-				return "nopt"
+			case PtModeNo46:
+				return "no46"
 			}
 		}
 		return "unknown"
@@ -101,9 +91,9 @@ var DNSMode atomic.Int32
 var BlockMode atomic.Int32
 
 // PtMode determines 6to4 translation heuristics.
-var PtMode = core.NewForeverFlow(PtModeAuto)
+var PtMode atomic.Int32
 
-// SetMode re-assigns d to DNSMode, b to BlockMode, pt to PtMode.
+// SetMode re-assigns d to DNSMode, b to BlockMode, pt to NatPtMode.
 func SetTunMode(d, b, pt int32) {
 	DNSMode.Store(d)
 	BlockMode.Store(b)
@@ -116,7 +106,7 @@ func SetTunMode(d, b, pt int32) {
 // is captured and replayed to the remote DoH server)
 // and with firewall disabled.
 func DefaultTunMode() {
-	SetTunMode(DNSModeIP, BlockModeNone, PtModeNone)
+	SetTunMode(DNSModeIP, BlockModeNone, PtModeNo46)
 }
 
 // DupTunFd instructs whether the TUN fd should be duplicated

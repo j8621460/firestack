@@ -33,12 +33,12 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
-	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/log"
+	"github.com/celzero/firestack/intra/settings"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/rawfile"
@@ -54,8 +54,8 @@ var _ stack.LinkEndpoint = (*endpoint)(nil)
 // placeholder FD for whenever existing FD wrapped in struct fds is closed.
 const invalidfd int = -1
 
-// waitttl is the time to wait for the dispatcher to wrap up (close a previous FD).
-const waitttl = 1 * time.Second
+// wrapttl is the time to wait for the dispatcher to wrap up (close a previous FD).
+const waitttl = wrapttl
 
 var errNeedsNewEndpoint = errors.New("ns: needs new endpoint")
 
@@ -73,7 +73,7 @@ type endpoint struct {
 	// fds is the set of file descriptors each identifying one inbound/outbound
 	// channel. The endpoint will dispatch from all inbound channels as well as
 	// hash outbound packets to specific channels based on the packet hash.
-	fds atomic.Pointer[fds]
+	fds *core.Volatile[*fds]
 
 	// mtu (maximum transmission unit) is the maximum size of a packet.
 	mtu atomic.Uint32
@@ -96,6 +96,20 @@ type endpoint struct {
 
 	// wg keeps track of running goroutines.
 	wg core.RollingWaitGroup
+
+	// maxSyscallHeaderBytes has the same meaning as
+	// Options.MaxSyscallHeaderBytes.
+	maxSyscallHeaderBytes uintptr
+
+	// writevMaxIovs is the maximum number of iovecs that may be passed to
+	// rawfile.NonBlockingWriteIovec, as possibly limited by
+	// maxSyscallHeaderBytes. (No analogous limit is defined for
+	// rawfile.NonBlockingSendMMsg, since in that case the maximum number of
+	// iovecs also depends on the number of mmsghdrs. Instead, if sendBatch
+	// encounters a packet whose iovec count is limited by
+	// maxSyscallHeaderBytes, it falls back to writing the packet using writev
+	// via WritePacket.)
+	writevMaxIovs int
 }
 
 // Options specify the details about the fd-based endpoint to be created.
@@ -129,6 +143,11 @@ type Options struct {
 	// RXChecksumOffload if true, indicates that this endpoints capability
 	// set should include CapabilityRXChecksumOffload.
 	RXChecksumOffload bool
+
+	// If MaxSyscallHeaderBytes is non-zero, it is the maximum number of bytes
+	// of struct iovec, msghdr, and mmsghdr that may be passed by each host
+	// system call.
+	MaxSyscallHeaderBytes int
 }
 
 // New creates a new fd-based endpoint.
@@ -160,12 +179,24 @@ func newFdbasedInjectableEndpoint(opts *Options) (SeamlessEndpoint, error) {
 		return nil, fmt.Errorf("opts.FD is empty, at least one FD must be specified")
 	}
 
+	if opts.MaxSyscallHeaderBytes < 0 {
+		return nil, fmt.Errorf("opts.MaxSyscallHeaderBytes is negative")
+	}
+
 	e := &endpoint{
 		mtu:     atomic.Uint32{},
-		fds:     atomic.Pointer[fds]{},
+		fds:     core.NewVolatile(invalidFds),
 		caps:    caps,
 		addr:    opts.Address,
 		hdrSize: hdrSize,
+		// MaxSyscallHeaderBytes remains unused
+		maxSyscallHeaderBytes: uintptr(opts.MaxSyscallHeaderBytes),
+		writevMaxIovs:         rawfile.MaxIovs,
+	}
+	if e.maxSyscallHeaderBytes != 0 {
+		if max := int(e.maxSyscallHeaderBytes / rawfile.SizeofIovec); max < e.writevMaxIovs {
+			e.writevMaxIovs = max
+		}
 	}
 
 	// Create per channel dispatchers; usually only one.
@@ -209,12 +240,10 @@ func (e *endpoint) Stat() (zz EpStat) {
 		Fd:        fds.tunFd, // f.tun() returns invalidfd if f.tunFd is closed
 		Alive:     !fds.closed.Load(),
 		Age:       core.FmtPeriod(age),
-		Read:      core.FmtBytes(fds.read.Load()),
-		Written:   core.FmtBytes(fds.written.Load()),
+		Read:      core.FmtBytes(uint64(fds.read.Load())),
+		Written:   core.FmtBytes(uint64(fds.written.Load())),
 		LastRead:  core.FmtUnixMillisAsPeriod(fds.lastRead.Load()),
 		LastWrite: core.FmtUnixMillisAsPeriod(fds.lastWrite.Load()),
-		IOStart:   core.FmtUnixMillisAsPeriod(fds.dispatchStart.Load()),
-		IOEnd:     core.FmtUnixMillisAsPeriod(fds.dispatchEnd.Load()),
 	}
 }
 
@@ -235,14 +264,11 @@ func (e *endpoint) Dispose() (err error) {
 	// dispatchLoop() will auto-exit on invalidfd
 	e.inboundDispatcher.wrapup(prevfd, wrapttl)
 	e.inboundDispatcher.prepare(invalidFds)
-	e.wait(waitttl)
 
 	return nil
 }
 
 // Implements FdSwapper.
-// Return errNeedsNewEndpoint for an invalid previous fd so magiclink can
-// replace the raw endpoint behind the stable link endpoint wrapper.
 func (e *endpoint) Swap(fd, mtu int) (err error) {
 	e.SetMTU(uint32(mtu))
 	return e.swap(fd, false)
@@ -265,9 +291,7 @@ func (e *endpoint) swap(fd int, force bool) (err error) {
 
 	e.fds.Store(f) // commence WritePackets() on fd
 
-	if log.Debug {
-		log.D("ns: tun(%s): swap: fd %s => %d; err? %v", prevfd, prevfd, fd, err)
-	}
+	log.D("ns: tun(%s): swap: fd %s => %d; err? %v", prevfd, prevfd, fd, err)
 
 	if e.inboundDispatcher == nil { // prevfd must be 0 value if inbound is nil
 		prevfd.stop() // prevfd may be invalid
@@ -276,14 +300,13 @@ func (e *endpoint) swap(fd int, force bool) (err error) {
 		// closes prevfd, which may be invalidfd
 		e.inboundDispatcher.wrapup(prevfd, wrapttl)
 		e.inboundDispatcher.prepare(f)
-		e.wait(waitttl)
 	}
 
 	hasDispatcher := e.dispatcher != nil
 	if err == nil && hasDispatcher { // attached?
 		log.I("ns: tun(%s): (%s => %d) swap: restart looper %t for new fd",
 			prevfd, prevfd, fd, hasDispatcher)
-		e.startDispatchLoop("ns.f.dispatch1."+strconv.Itoa(f.tun()), e.inboundDispatcher, f)
+		go dispatchLoop(e.inboundDispatcher, f, &e.wg)
 	} else { // wait for Attach to be called eventually
 		log.E("ns: tun(%s): (%s => %d) swap: no dispatcher? %t for new fd; err %v",
 			prevfd, prevfd, fd, !hasDispatcher, err)
@@ -294,9 +317,7 @@ func (e *endpoint) swap(fd int, force bool) (err error) {
 // Attach launches the goroutine that reads packets from the file descriptor and
 // dispatches them via the provided dispatcher.
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
-	if log.Debug {
-		log.D("ns: attaching nic... %t", dispatcher != nil)
-	}
+	log.D("ns: attaching nic... %t", dispatcher != nil)
 
 	e.Lock()
 	defer e.Unlock()
@@ -330,13 +351,9 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	}
 
 	if dispatcher != nil && e.dispatcher == nil {
-		ok := fds.ok()
+		log.I("ns: tun(%d): attach: new dispatcher & looper", fd)
 		e.dispatcher = dispatcher
-		logei(!ok)("ns: tun(%d): attach: new dispatcher & looper? %t", fd, ok)
-		if !ok {
-			return
-		}
-		if e.inboundDispatcher == nil { // unlikely
+		if e.inboundDispatcher == nil && fds.ok() { // unlikely
 			var err error
 			e.inboundDispatcher, err = createInboundDispatcher(e, fds)
 			logeif(err)("ns: tun(%d): attach: just-in-time createInboundDispatcher; err? %v", fd, err)
@@ -345,7 +362,7 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 			}
 			rx = e.inboundDispatcher
 		}
-		e.startDispatchLoop("ns.f.dispatch2."+strconv.Itoa(fds.tun()), rx, fds)
+		go dispatchLoop(rx, fds, &e.wg)
 		return
 	}
 
@@ -398,11 +415,6 @@ func (e *endpoint) wait(d time.Duration) bool {
 	return core.Await(func() { e.Wait() }, d)
 }
 
-func (e *endpoint) startDispatchLoop(who string, inbound linkDispatcher, f *fds) {
-	e.wg.Add(1)
-	core.Go(who, func() { dispatchLoop(inbound, f, &e.wg) })
-}
-
 // AddHeader implements stack.LinkEndpoint.AddHeader.
 func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
 	if e.hdrSize > 0 && pkt != nil {
@@ -440,8 +452,8 @@ func (e *endpoint) fd() int {
 	return e.fds.Load().tun()
 }
 
-// writePackets writes outbound packets to the file descriptor. If the fd is
-// invalid, the packet is dropped and ErrNoSuchFile is returned.
+// writePackets writes outbound packets to the file descriptor. If it is not
+// currently writable, the packet is dropped.
 // Way more simplified than og impl, ref: github.com/google/gvisor/issues/7125
 func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	if pkts.Len() == 0 {
@@ -457,24 +469,6 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	fd := fds.tun() // if closed, returns invalidfd
 
 	if fd == invalidfd {
-		// Outbound path: Route.WritePacket -> gVisor network endpoint -> NIC
-		// -> NIC qdisc -> LinkWriter.WritePackets -> magiclink.WritePackets
-		// -> this raw endpoint. The stack installs its default direct qdisc
-		// when CreateNIC is called without NICOptions.QDisc, as it is here;
-		// that qdisc propagates this error to the transport protocol. A
-		// configured asynchronous qdisc may instead enqueue the packet and
-		// discard this lower-level error in its worker.
-		//
-		// During Dispose/Swap, the stable magiclink can briefly point at a raw
-		// endpoint whose old fd is invalid before the replacement is attached.
-		// This packet cannot be written and is therefore lost; returning zero
-		// with nil would falsely report a successful send. ErrNoSuchFile makes
-		// the failed send visible: TCP records a segment-send failure (SYN
-		// send errors are handled by TCP's retry path), UDP returns the error
-		// from its Write path because it only suppresses ErrNoBufferSpace, and
-		// ICMP propagates/logs the route or direct LinkWriter failure. None of
-		// these paths retries this already-lost packet because of this return;
-		// the magiclink replacement only makes later packets writable.
 		log.E("ns: tun(-1): WritePackets (to tun): fd invalid (pkts: %d)", pkts.Len())
 		return 0, &tcpip.ErrNoSuchFile{}
 	}
@@ -484,7 +478,7 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	total := pkts.Len()
 
 	defer func() {
-		fds.written.Add(uint64(written)) // update written bytes
+		fds.written.Add(int64(written)) // update written bytes
 		fds.lastWrite.Store(time.Now().UnixMilli())
 	}()
 
@@ -511,13 +505,13 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	}
 	if len(batch) > 0 {
 		if errno := rawfile.NonBlockingWriteIovec(fd, batch); errno != 0 {
-			log.W("ns: tun(%d): WritePackets (to tun): err(%v), sent(%d)/total(%d)", fd, errno, written, total)
+			log.W("ns: tun(%d): WritePackets (to tun): err(%v), sent(%d)/total(%d)", fd, errno, packets, total)
 			return written, tcpip.TranslateErrno(errno)
 		}
 		written += packets
 	}
 
-	if log.Verbose {
+	if settings.Debug {
 		log.VV("ns: tun(%d): WritePackets (to tun): written(%d)/total(%d)", fd, written, total)
 	}
 	return written, nil
@@ -539,6 +533,7 @@ func dispatchLoop(inbound linkDispatcher, f *fds, wg *core.RollingWaitGroup) tcp
 	// defer core.RecoverFn("ns.e.dispatch", e.notifyRestart)
 	defer core.Recover(core.Exit11, "ns.e.dispatch")
 
+	wg.Add(1)
 	defer wg.Done()
 
 	if inbound == nil || core.IsNil(inbound) {
@@ -548,7 +543,6 @@ func dispatchLoop(inbound linkDispatcher, f *fds, wg *core.RollingWaitGroup) tcp
 	}
 
 	start := time.Now()
-	f.dispatchStart.Store(start.UnixMilli())
 	log.I("ns: tun(%d): dispatchLoop: start", f.tun())
 	for {
 		cont, err := inbound.dispatch(f)
@@ -558,7 +552,6 @@ func dispatchLoop(inbound linkDispatcher, f *fds, wg *core.RollingWaitGroup) tcp
 		}
 		if !cont {
 			defer f.stop()
-			f.dispatchEnd.Store(time.Now().UnixMilli())
 			return err
 		} // else: continue dispatching
 	}
@@ -593,15 +586,11 @@ func (e *endpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stac
 	d, fds := e.getDispatchers()
 	fd := fds.tun()
 
-	if log.Verbose {
-		log.VV("ns: tun(%d): inject-inbound (from tun) %s; %d", fd, fds, protocol)
-	}
+	log.VV("ns: tun(%d): inject-inbound (from tun) %s; %d", fd, fds, protocol)
 	if d != nil && pkt != nil {
 		d.DeliverNetworkPacket(protocol, pkt)
 	} else {
 		log.W("ns: tun(%d): inject-inbound (from tun) %d pkt?(%t) dropped: endpoint not attached", fd, protocol, pkt != nil)
-		// TODO? has the pkt ownership is transferred to us; release it if we can't deliver
-		// if pkt != nil { pkt.DecRef() }
 	}
 }
 
@@ -617,11 +606,11 @@ func (e *endpoint) InjectOutbound(dest tcpip.Address, packet *buffer.View) tcpip
 	}
 
 	b := packet.AsSlice()
-	sz := uint64(len(b))
+	sz := int64(len(b))
 	defer f.written.Add(sz) // update written bytes
 	defer f.lastWrite.Store(time.Now().UnixMilli())
 
-	if log.Verbose {
+	if settings.Debug {
 		log.VV("ns: tun(%d): inject-outbound (to tun) to dst(%v) sz(%d)", fd, dest, sz)
 	}
 

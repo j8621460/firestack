@@ -74,7 +74,7 @@ type muxer struct {
 	uid    string // user id owner of mxconn
 	stats  *stats
 
-	until atomic.Int64 // [time.Time] as unix millis deadline extension
+	until *core.Volatile[time.Time] // deadline extension
 
 	dxconns  chan *demuxconn // never closed
 	dxconnWG *sync.WaitGroup // wait group for demuxed conns
@@ -130,6 +130,7 @@ func newMuxer(cid, pid, uid string, conn net.PacketConn, vnd vendor, f core.Fina
 		uid:      uid,
 		mxconn:   conn,
 		stats:    &stats{start: time.Now()},
+		until:    core.NewZeroVolatile[time.Time](),
 		routes:   make(map[netip.AddrPort]*demuxconn),
 		rmu:      sync.RWMutex{},
 		dxconns:  make(chan *demuxconn),
@@ -148,7 +149,7 @@ func (x *muxer) awaiters() {
 	for {
 		select {
 		case c := <-x.dxconns:
-			if log.Debug {
+			if settings.Debug {
 				log.D("udp: mux: %s awaiter: watching %s => %s", c.cid, c.laddr, c.raddr)
 			}
 			x.dxconnWG.Add(1) // accept
@@ -166,20 +167,23 @@ func (x *muxer) awaiters() {
 
 // stop closes conns in the backlog, stops accepting new conns,
 // closes muxconn, and waits for demuxed conns to close.
-func (x *muxer) stop() {
-	if log.Debug {
+func (x *muxer) stop() error {
+	if settings.Debug {
 		log.D("udp: mux: %s stop", x.cid)
 	}
 
+	var err error
 	x.once.Do(func() {
 		close(x.doneCh)
-		x.drain()               // drain all demuxconns
-		err := x.mxconn.Close() // close the muxed conn
+		x.drain()
+		err = x.mxconn.Close() // close the muxed conn
 
-		x.dxconnWG.Wait()          // until all demuxconn closed / errored out
+		x.dxconnWG.Wait()          // all conns close / error out
 		core.Go("udpmux.cb", x.cb) // dissociate
-		logei(err)("udp: mux: %s stopped; stats: %s; onclose: %v", x.cid, x.stats, err)
+		log.I("udp: mux: %s stopped; stats: %s", x.cid, x.stats)
 	})
+
+	return err
 }
 
 func (x *muxer) drain() {
@@ -187,7 +191,7 @@ func (x *muxer) drain() {
 	defer x.rmu.Unlock()
 
 	defer clear(x.routes)
-	if log.Debug {
+	if settings.Debug {
 		log.D("udp: mux: %s drain: closing %d demuxed conns", x.cid, len(x.routes))
 	}
 	for _, c := range x.routes {
@@ -201,7 +205,9 @@ func (x *muxer) drain() {
 //  2. Creating a new Conn when receiving from a new remote.
 func (x *muxer) readers() {
 	// todo: recover must call "recycle()" if it wasn't.
-	defer x.stop()
+	defer func() {
+		_ = x.stop() // stop muxer
+	}()
 
 	timeouterrors := 0
 	for {
@@ -224,7 +230,7 @@ func (x *muxer) readers() {
 			if timeouterrors < maxtimeouterrors {
 				// extend by preset (min) udp timeout
 				x.extend(time.Now().Add(time.Second * udptimeout))
-				if log.Debug {
+				if settings.Debug {
 					log.D("udp: mux: %s read timeout(%d): %v", x.cid, timeouterrors, err)
 				}
 				recycle()
@@ -251,9 +257,6 @@ func (x *muxer) readers() {
 		if dst := x.route(todoCid, addr2netip(who), ingress); dst != nil {
 			select {
 			case dst.inCh <- &slice{v: b[:n], fin: recycle}: // incomingCh is never closed
-			case <-dst.closed:
-				err = errUdpUnconnected
-				recycle()
 			default: // dst probably closed, but not yet unrouted
 				err = errUdpIncomingDrop
 				recycle()
@@ -337,13 +340,14 @@ func (x *muxer) sendto(p []byte, addr net.Addr) (int, error) {
 }
 
 func (x *muxer) extend(t time.Time) {
+	c := x.until.Load()
 	if t.IsZero() {
 		extend(x.mxconn, 0)
-		x.until.Store(t.UnixMilli())
-	} else if c := x.until.Load(); c == 0 || c < t.UnixMilli() {
+		x.until.Store(t)
+	} else if c.IsZero() || c.Before(t) {
 		// extend if t is after existing deadline at x.until
 		extend(x.mxconn, time.Until(t))
-		x.until.Store(t.UnixMilli())
+		x.until.Store(t)
 	}
 }
 
@@ -383,13 +387,10 @@ func (c *demuxconn) Read(p []byte) (int, error) {
 	defer c.rt.Reset(c.rto)
 	select {
 	case <-c.rt.C:
-		// TODO: close demuxconn?
 		log.W("udp: mux: %s demux: read: %v <= %v; timeout (sz: %d)",
 			c.out.id(), c.laddr, c.raddr, sz)
 		return 0, os.ErrDeadlineExceeded
 	case <-c.closed:
-		// demuxconn may already be closed
-		defer core.Close(c)
 		log.W("udp: mux: %s demux: read: %v <= %v; closed (sz: %d)",
 			c.out.id(), c.laddr, c.raddr, sz)
 		return 0, net.ErrClosed
@@ -412,13 +413,10 @@ func (c *demuxconn) Write(p []byte) (n int, err error) {
 	defer c.wt.Reset(c.wto)
 	select {
 	case <-c.wt.C:
-		// TODO: close demuxconn?
 		log.W("udp: mux: %s demux: write: %v => %v; timeout (sz: %d)",
 			c.out.id(), c.laddr, c.raddr, sz)
 		return 0, os.ErrDeadlineExceeded
 	case <-c.closed:
-		// demuxconn may already be closed
-		defer core.Close(c)
 		log.W("udp: mux: %s demux: write: %v => %v; closed (sz: %d)",
 			c.out.id(), c.laddr, c.raddr, sz)
 		return 0, net.ErrClosed
@@ -475,30 +473,18 @@ func (c *demuxconn) CloseWrite() (err error) {
 
 // Close implements core.UDPConn.Close
 func (c *demuxconn) Close() error {
-	if log.Debug {
+	if settings.Debug {
 		log.D("udp: mux: %s demux %s => %s close, inC: %d, overC: %d",
 			c.out.id(), c.laddr, c.raddr, len(c.inCh), len(c.overflowCh))
 	}
 	c.once.Do(func() {
-		defer c.wt.Stop()
-		defer c.rt.Stop()
-
-		// leave c.inCh or c.overflowCh unclosed:
-		//  1. readers() races the drain loop: after the loop exits via
-		//     default, readers() can still non-deterministically send one
-		//     last *slice (16KB fin closure) to inCh before the deferred
-		//     close runs.
-		//  2. close(c.overflowCh) runs first (LIFO); if io() is concurrently
-		//     executing inside Read() and writes to overflowCh after the close,
-		//     that is a send-on-closed-channel panic.
-		//  3. after both channels are closed, Read()'s select may receive nil
-		//     from them (closed-empty), causing a nil-deref panic in io().
-		// Channels are GC'd with the demuxconn; Read() is already woken by
-		// <-c.closed so no goroutines are left blocked on inCh/overflowCh.
-
 		close(c.closed) // sig close
+
 		c.readClosed.Store(true)
 		c.writeClosed.Store(true)
+
+		defer c.wt.Stop()
+		defer c.rt.Stop()
 		for {
 			select {
 			case sx := <-c.inCh:
@@ -577,7 +563,7 @@ func (c *demuxconn) io(out *[]byte, in *slice) (int, error) {
 			return n, io.ErrShortWrite
 		}
 	} else {
-		if log.Verbose {
+		if settings.Debug {
 			log.VV("udp: mux: %s demux: read: %v <= %v done(sz: %d)", id, c.laddr, c.raddr, n)
 		}
 		in.fin()
@@ -637,35 +623,20 @@ func (e *muxTable) associate(cid, pid, uid string, src, dst netip.AddrPort, mk a
 			anyaddrport = netip.AddrPortFrom(anyaddr, src.Port())
 		}
 
-		// mk may block; holding mutex then blocks all udp flows.
-		e.Unlock()
+		pc, err := mk(proto, anyaddrport.String())
 
-		pc, derr := mk(proto, anyaddrport.String())
-		if derr != nil {
+		if err != nil {
 			core.Close(pc)
-			return nil, derr
+			e.Unlock()      // unlock
+			return nil, err // return
 		}
 
-		e.Lock()
-		pxm = e.t[pid]
-		if pxm == nil {
-			pxm = make(map[netip.AddrPort]*muxer)
-			e.t[pid] = pxm
-		}
-		// another goroutine may have dialed the same
-		if existing := pxm[src]; existing != nil {
-			mxr = existing
-			core.Close(pc) // lost the race; drop our pc
-			log.I("udp: mux: %s use existing assoc for %s %s via %s; fwd? %t",
-				cid, pid, src, anyaddrport, portfwd)
-		} else {
-			mxr = newMuxer(cid, pid, uid, pc, v, func() {
-				e.dissociate(cid, pid, src)
-			})
-			pxm[src] = mxr
-			log.I("udp: mux: %s new assoc for %s %s via %s; fwd? %t",
-				cid, pid, src, anyaddrport, portfwd)
-		}
+		mxr = newMuxer(cid, pid, uid, pc, v, func() {
+			e.dissociate(cid, pid, src)
+		})
+		pxm[src] = mxr
+		log.I("udp: mux: %s new assoc for %s %s via %s; fwd? %t",
+			cid, pid, src, anyaddrport, portfwd)
 	}
 
 	if mxr.pid != pid {
@@ -695,27 +666,6 @@ func (e *muxTable) dissociate(cid, pid string, src netip.AddrPort) {
 	defer e.Unlock()
 	pxm := e.t[pid] // may be nil and that's okay
 	delete(pxm, src)
-}
-
-// reset closes all muxers and clears the table. Called on tunnel restarts so
-// that stale muxers (bound to the previous stack's conns) don't survive into
-// the new stack. The dissociate callbacks of stopped muxers operate on the
-// replaced table and are no-ops.
-func (e *muxTable) reset() {
-	if e == nil {
-		return
-	}
-	e.Lock()
-	pxms := e.t
-	e.t = make(map[string]map[netip.AddrPort]*muxer)
-	e.Unlock()
-
-	for _, pxm := range pxms {
-		for _, mxr := range pxm {
-			mxr.stop()
-		}
-	}
-	log.I("udp: mux: reset; closed %d pids", len(pxms))
 }
 
 func addr2netip(addr net.Addr) (zz netip.AddrPort) {

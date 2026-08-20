@@ -21,37 +21,37 @@ import (
 // A IpTree is a thread-safe trie that supports insertion, deletion, and route matching IP CIDRs.
 type IpTree interface {
 	// Adds value v to the cidr route.
-	Add(cidr, v string) error
+	Add(cidr, v *Gostr) error
 	// Sets cidr route to v, overwriting any previous value.
-	Set(cidr, v string) error
+	Set(cidr, v *Gostr) error
 	// Removes value v, if found.
-	Esc(cidr, v string) bool
+	Esc(cidr, v *Gostr) bool
 	// Deletes cidr route. Returns true if cidr was found.
-	Del(cidr string) bool
+	Del(cidr *Gostr) bool
 	// Gets the value of cidr or "" if cidr is not found.
-	Get(cidr string) (string, error)
+	Get(cidr *Gostr) (*Gostr, error)
 	// Returns true if the cidr route is found.
-	Has(cidr string) (bool, error)
+	Has(cidr *Gostr) (bool, error)
 	// Returns csv of all routes matching cidr or "".
-	Routes(cidr string) string
+	Routes(cidr *Gostr) *Gostr
 	// Returns csv of values of all routes matching cidr or "".
-	Values(cidr string) string
+	Values(cidr *Gostr) *Gostr
 	// Returns the route@csv(value) of any route matching cidr or "".
-	GetAny(cidr string) (string, error)
+	GetAny(cidr *Gostr) (*Gostr, error)
 	// Returns true if any route matches cidr.
-	HasAny(cidr string) (bool, error)
+	HasAny(cidr *Gostr) (bool, error)
 	// Removes values like v ("*v*") for cidr.
-	EscLike(cidr, likev string) int32
+	EscLike(cidr, likev *Gostr) int32
 	// Returns csv of all routes with any value like v matching cidr.
-	RoutesLike(cidr, likev string) string
+	RoutesLike(cidr, likev *Gostr) *Gostr
 	// Returns csv of all routes with values like v for cidr.
-	ValuesLike(cidr, likev string) string
+	ValuesLike(cidr, likev *Gostr) *Gostr
 	// Returns csv of all values like v for cidr.
-	GetLike(cidr, likev string) string
+	GetLike(cidr, likev *Gostr) *Gostr
 	// Returns the longest route for cidr as "r1@csv(v)|r2@csv(v2)" or "".
-	GetAll(cidr string) (string, error)
+	GetAll(cidr *Gostr) (*Gostr, error)
 	// Deletes all routes matching cidr. Returns the number of routes deleted.
-	DelAll(cidr string) int32
+	DelAll(cidr *Gostr) int32
 	// Clears the trie.
 	Clear()
 	// Returns the number of routes.
@@ -60,8 +60,7 @@ type IpTree interface {
 
 type iptree struct {
 	sync.RWMutex
-	t4 *critbitgo.Net // IPv4 routes
-	t6 *critbitgo.Net // IPv6 routes
+	t *critbitgo.Net
 }
 
 const (
@@ -81,22 +80,11 @@ var (
 
 // NewIpTree returns a new IpTree.
 func NewIpTree() IpTree {
-	return &iptree{
-		t4: critbitgo.NewNet(),
-		t6: critbitgo.NewNet(),
-	}
+	return &iptree{t: critbitgo.NewNet()}
 }
 
-// net returns the trie for the address family of r.
-func (c *iptree) net(r *net.IPNet) *critbitgo.Net {
-	if r.IP.To4() != nil {
-		return c.t4
-	}
-	return c.t6
-}
-
-func (c *iptree) Add(cidr string, v string) error {
-	return c.add(cidr, v)
+func (c *iptree) Add(cidr *Gostr, v *Gostr) error {
+	return c.add(cidr.V(), v.V())
 }
 
 func (c *iptree) add(cidr string, v string) error {
@@ -120,9 +108,9 @@ func (c *iptree) add(cidr string, v string) error {
 	return c.set(cidr, x+Vsep+v)
 }
 
-func (c *iptree) Set(cidr string, v string) error {
-	c.del(cidr) // delete any previous value
-	return c.add(cidr, v)
+func (c *iptree) Set(cidr *Gostr, v *Gostr) error {
+	c.del(cidr.V()) // delete any previous value
+	return c.add(cidr.V(), v.V())
 }
 
 func (c *iptree) set(cidr string, v string) error {
@@ -131,15 +119,14 @@ func (c *iptree) set(cidr string, v string) error {
 		return err
 	}
 
-	t := c.net(r)
 	c.Lock()
 	defer c.Unlock()
 
-	return t.Add(r, v)
+	return c.t.Add(r, v)
 }
 
-func (c *iptree) Del(cidr string) bool {
-	return c.del(cidr)
+func (c *iptree) Del(cidr *Gostr) bool {
+	return c.del(cidr.V())
 }
 
 func (c *iptree) del(cidr string) bool {
@@ -148,16 +135,15 @@ func (c *iptree) del(cidr string) bool {
 		return false
 	}
 
-	t := c.net(r)
 	c.Lock()
 	defer c.Unlock()
 
-	_, ok, err := t.Delete(r)
+	_, ok, err := c.t.Delete(r)
 	return ok && err == nil
 }
 
-func (c *iptree) Esc(cidr string, v string) bool {
-	return c.esc(cidr, v)
+func (c *iptree) Esc(cidr *Gostr, v *Gostr) bool {
+	return c.esc(cidr.V(), v.V())
 }
 
 func (c *iptree) esc(cidr string, v string) bool {
@@ -184,8 +170,8 @@ func (c *iptree) esc(cidr string, v string) bool {
 	return false
 }
 
-func (c *iptree) Has(cidr string) (bool, error) {
-	return c.has(cidr)
+func (c *iptree) Has(cidr *Gostr) (bool, error) {
+	return c.has(cidr.V())
 }
 
 func (c *iptree) has(cidr string) (bool, error) {
@@ -194,16 +180,15 @@ func (c *iptree) has(cidr string) (bool, error) {
 		return false, err
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
-	_, ok, err := t.Get(r)
+	_, ok, err := c.t.Get(r)
 	return ok, err
 }
 
-func (c *iptree) DelAll(cidr string) (n int32) {
-	return c.delAll(cidr)
+func (c *iptree) DelAll(cidr *Gostr) (n int32) {
+	return c.delAll(cidr.V())
 }
 
 func (c *iptree) delAll(cidr string) (n int32) {
@@ -212,26 +197,25 @@ func (c *iptree) delAll(cidr string) (n int32) {
 		return
 	}
 
-	t := c.net(r)
 	c.Lock()
 	defer c.Unlock()
 
 	keys := make([]*net.IPNet, 0)
-	t.WalkMatch(r, func(k *net.IPNet, _ any) bool {
+	c.t.WalkMatch(r, func(k *net.IPNet, _ any) bool {
 		keys = append(keys, k)
 		return true
 	})
 
 	for _, k := range keys {
-		if _, ok, err := t.Delete(k); ok && err == nil {
+		if _, ok, err := c.t.Delete(k); ok && err == nil {
 			n++
 		}
 	}
 	return
 }
 
-func (c *iptree) HasAny(cidr string) (bool, error) {
-	return c.hasAny(cidr)
+func (c *iptree) HasAny(cidr *Gostr) (bool, error) {
+	return c.hasAny(cidr.V())
 }
 
 func (c *iptree) hasAny(cidr string) (bool, error) {
@@ -240,20 +224,19 @@ func (c *iptree) hasAny(cidr string) (bool, error) {
 		return false, err
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
-	m, _, err := t.Match(r)
+	m, _, err := c.t.Match(r)
 	return m != nil, err
 }
 
-func (c *iptree) Get(cidr string) (string, error) {
-	r, err := c.get(cidr)
+func (c *iptree) Get(cidr *Gostr) (*Gostr, error) {
+	r, err := c.get(cidr.V())
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return r, nil // r may be empty
+	return StrOf(r), nil // r may be empty
 }
 
 func (c *iptree) get(cidr string) (v string, err error) {
@@ -262,11 +245,10 @@ func (c *iptree) get(cidr string) (v string, err error) {
 		return "", err
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
-	s, ok, err := t.Get(r)
+	s, ok, err := c.t.Get(r)
 	if ok && err == nil {
 		if v, ok = s.(string); !ok {
 			return "", errValNotString
@@ -277,12 +259,12 @@ func (c *iptree) get(cidr string) (v string, err error) {
 	return
 }
 
-func (c *iptree) GetAny(cidr string) (string, error) {
-	r, err := c.getAny(cidr)
+func (c *iptree) GetAny(cidr *Gostr) (*Gostr, error) {
+	r, err := c.getAny(cidr.V())
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return r, nil // r may be empty
+	return StrOf(r), nil // r may be empty
 }
 
 func (c *iptree) getAny(cidr string) (rv string, err error) {
@@ -291,11 +273,10 @@ func (c *iptree) getAny(cidr string) (rv string, err error) {
 		return "", err
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
-	m, v, err := t.Match(r)
+	m, v, err := c.t.Match(r)
 	if err != nil {
 		return "", err
 	}
@@ -310,12 +291,12 @@ func (c *iptree) getAny(cidr string) (rv string, err error) {
 	return
 }
 
-func (c *iptree) GetAll(cidr string) (string, error) {
-	r, err := c.getAll(cidr)
+func (c *iptree) GetAll(cidr *Gostr) (*Gostr, error) {
+	r, err := c.getAll(cidr.V())
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return r, nil // r may be empty
+	return StrOf(r), nil // r may be empty
 }
 
 func (c *iptree) getAll(cidr string) (rv string, err error) {
@@ -324,11 +305,10 @@ func (c *iptree) getAll(cidr string) (rv string, err error) {
 		return "", err
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
-	t.WalkMatch(r, func(k *net.IPNet, v any) bool {
+	c.t.WalkMatch(r, func(k *net.IPNet, v any) bool {
 		if k == nil {
 			return true // next
 		}
@@ -344,8 +324,8 @@ func (c *iptree) getAll(cidr string) (rv string, err error) {
 	return strings.TrimRight(rv, KVsep), nil
 }
 
-func (c *iptree) Routes(cidr string) string {
-	return c.routes(cidr)
+func (c *iptree) Routes(cidr *Gostr) *Gostr {
+	return StrOf(c.routes(cidr.V()))
 }
 
 func (c *iptree) routes(cidr string) string {
@@ -354,12 +334,11 @@ func (c *iptree) routes(cidr string) string {
 		return ""
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
 	rt := make([]string, 0)
-	t.WalkMatch(r, func(k *net.IPNet, _ any) bool {
+	c.t.WalkMatch(r, func(k *net.IPNet, _ any) bool {
 		if k != nil {
 			rt = append(rt, k.String())
 		}
@@ -368,8 +347,8 @@ func (c *iptree) routes(cidr string) string {
 	return strings.Join(rt, Ksep)
 }
 
-func (c *iptree) Values(cidr string) string {
-	return c.values(cidr)
+func (c *iptree) Values(cidr *Gostr) *Gostr {
+	return StrOf(c.values(cidr.V()))
 }
 
 func (c *iptree) values(cidr string) string {
@@ -378,12 +357,11 @@ func (c *iptree) values(cidr string) string {
 		return ""
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
 	vt := make([]string, 0)
-	t.WalkMatch(r, func(_ *net.IPNet, v any) bool {
+	c.t.WalkMatch(r, func(_ *net.IPNet, v any) bool {
 		if v != nil {
 			if s, ok := v.(string); ok && len(s) > 0 {
 				vt = append(vt, s)
@@ -394,8 +372,8 @@ func (c *iptree) values(cidr string) string {
 	return strings.Join(vt, Vsep)
 }
 
-func (c *iptree) EscLike(cidr, like string) int32 {
-	return c.escLike(cidr, like)
+func (c *iptree) EscLike(cidr, like *Gostr) int32 {
+	return c.escLike(cidr.V(), like.V())
 }
 
 func (c *iptree) escLike(cidr, like string) int32 {
@@ -432,8 +410,8 @@ func (c *iptree) escLike(cidr, like string) int32 {
 	return 0 // not found
 }
 
-func (c *iptree) GetLike(cidr, like string) string {
-	return c.getLike(cidr, like)
+func (c *iptree) GetLike(cidr, like *Gostr) *Gostr {
+	return StrOf(c.getLike(cidr.V(), like.V()))
 }
 
 func (c *iptree) getLike(cidr, like string) string {
@@ -457,8 +435,8 @@ func (c *iptree) getLike(cidr, like string) string {
 	return "" // not found
 }
 
-func (c *iptree) RoutesLike(cidr, like string) string {
-	return c.routesLike(cidr, like)
+func (c *iptree) RoutesLike(cidr, like *Gostr) *Gostr {
+	return StrOf(c.routesLike(cidr.V(), like.V()))
 }
 
 func (c *iptree) routesLike(cidr, like string) string {
@@ -467,12 +445,11 @@ func (c *iptree) routesLike(cidr, like string) string {
 		return ""
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
 	rt := make([]string, 0)
-	t.WalkMatch(r, func(k *net.IPNet, v any) bool {
+	c.t.WalkMatch(r, func(k *net.IPNet, v any) bool {
 		if v == nil {
 			return true // next
 		}
@@ -483,18 +460,17 @@ func (c *iptree) routesLike(cidr, like string) string {
 			// grab all occurrences of v in csv s
 			for val := range strings.SplitSeq(s, Vsep) {
 				if strings.HasPrefix(val, like) {
-					rt = append(rt, k.String())
-					return true // next
-				} // else: val+Vsep+val not prefixed with "like"
+					rt = append(rt, val)
+				}
 			}
-		} // else: v not a string?
+		}
 		return true // next
 	})
 	return strings.Join(rt, Ksep)
 }
 
-func (c *iptree) ValuesLike(cidr, like string) string {
-	return c.valuesLike(cidr, like)
+func (c *iptree) ValuesLike(cidr, like *Gostr) *Gostr {
+	return StrOf(c.valuesLike(cidr.V(), like.V()))
 }
 
 func (c *iptree) valuesLike(cidr, like string) string {
@@ -503,12 +479,11 @@ func (c *iptree) valuesLike(cidr, like string) string {
 		return ""
 	}
 
-	t := c.net(r)
 	c.RLock()
 	defer c.RUnlock()
 
 	vt := make([]string, 0)
-	t.WalkMatch(r, func(k *net.IPNet, v any) bool {
+	c.t.WalkMatch(r, func(k *net.IPNet, v any) bool {
 		if v == nil {
 			return true // next
 		}
@@ -532,15 +507,14 @@ func (c *iptree) Clear() {
 	c.Lock()
 	defer c.Unlock()
 
-	c.t4.Clear()
-	c.t6.Clear()
+	c.t.Clear()
 }
 
 func (c *iptree) Len() int {
 	c.RLock()
 	defer c.RUnlock()
 
-	return c.t4.Size() + c.t6.Size()
+	return c.t.Size()
 }
 
 func ip2cidr(ippOrCidr string) (*net.IPNet, error) {

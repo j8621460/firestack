@@ -7,32 +7,25 @@
 package dialers
 
 import (
-	"errors"
 	"net"
 	"net/netip"
-	"net/url"
 
 	"github.com/celzero/firestack/intra/log"
 	"github.com/celzero/firestack/intra/protect"
 	"github.com/celzero/firestack/intra/protect/ipmap"
-	"github.com/celzero/firestack/intra/xdns"
-	"github.com/miekg/dns"
 )
 
-const ()
-
-var (
-	errNilConn      = errors.New("nil conn")
-	errNoConn       = errNilConn
-	errNoEch        = errors.New("no ech")
-	errEchQTimeout  = errors.New("ech query timeout")
-	errNoSysConn    = errors.New("no sys conn")
-	errNoDesyncConn = errors.New("no desync conn")
-	errTLSHandshake = errors.New("tls handshake failed")
-	errNoIps        = errors.New("no ips")
-	errNoDialer     = errors.New("no dialer")
-	errNoRetrier    = errors.New("no retrier")
-	errNoListener   = errors.New("no listener")
+const (
+	errNilConn      = net.UnknownNetworkError("nil connection")
+	errNoConn       = net.UnknownNetworkError("no connection")
+	errNoSysConn    = net.UnknownNetworkError("no sys connection")
+	errNoDesyncConn = net.UnknownNetworkError("no desync connection")
+	errTLSHandshake = net.UnknownNetworkError("tls handshake may be failed")
+	errNoIps        = net.UnknownNetworkError("no ips")
+	errNoEch        = net.UnknownNetworkError("no ech")
+	errNoDialer     = net.UnknownNetworkError("no dialer")
+	errNoRetrier    = net.UnknownNetworkError("no retrier")
+	errNoListener   = net.UnknownNetworkError("no listener")
 )
 
 var ipm ipmap.IPMap = ipmap.NewIPMap()
@@ -40,10 +33,10 @@ var ipm ipmap.IPMap = ipmap.NewIPMap()
 // Resolves hostOrIP, and re-seeds it if existing is non-empty.
 // hostOrIP may be host:port, or ip:port, or host, or ip.
 func renew(hostOrIP string, existing *ipmap.IPSet) (cur *ipmap.IPSet, ok bool) {
-	// will never be able to resolve protected hosts (Selfhost, Systemhost),
+	// will never be able to resolve protected hosts (UidSelf, UidRethink),
 	// and so, keep existing as-is (we do not want to use NewProtected and
-	// race against dnsx.RegisterAddrs or other clients updating Selfhost or
-	// Systemhost as changes come in from kotlinland intra.Bridge)
+	// race against dnsx.RegisterAddrs or other clients updating UidSelf or
+	// UidRethink as changes come in from kotlinland intra.Bridge)
 	if protect.NeverResolve(hostOrIP) {
 		cur = existing.Reset()
 	} else if existing.Protected() {
@@ -75,15 +68,13 @@ func renew(hostOrIP string, existing *ipmap.IPSet) (cur *ipmap.IPSet, ok bool) {
 
 // New re-seeds hostOrIP with a new set of ips.
 // hostOrIP may be host:port, or ip:port, or host, or ip.
-// ipps may be ip or ip:port. It makes no attempt to resolve hostOrIP.
-// see also: [For] and [NewProtected].
+// ipps may be ip or ip:port.
 func New(hostOrIP string, ipps []string) (*ipmap.IPSet, bool) {
 	ips := ipm.MakeIPSet(hostOrIP, ipps, ipmap.AutoType)
 	return ips, !ips.Empty()
 }
 
 // hostOrIP may be host:port, or ip:port, or host, or ip.
-// It makes no attempt to resolve hostOrIP, and returns a non-nil ipset.
 func NewProtected(hostOrIP string, ipps []string) (*ipmap.IPSet, bool) {
 	ips := ipm.MakeIPSet(hostOrIP, ipps, ipmap.Protected)
 	return ips, !ips.Empty()
@@ -91,8 +82,7 @@ func NewProtected(hostOrIP string, ipps []string) (*ipmap.IPSet, bool) {
 
 // For returns addresses for hostOrIP from cache, resolving them if missing.
 // Underlying cache relies on Disconfirm() to remove unreachable IP addrs;
-// if not called, these entries may go stale. Use [Resolve] to bypass cache.
-// Use CachedAddrs() to only ever return from cache.
+// if not called, these entries may go stale. Use Resolve() to bypass cache.
 // hostOrIP may be host:port, or ip:port, or host, or ip.
 func For(hostOrIP string) []netip.Addr {
 	ipset := ipm.Get(hostOrIP)
@@ -100,16 +90,6 @@ func For(hostOrIP string) []netip.Addr {
 		return ipset.Addrs()
 	}
 	return nil
-}
-
-// ForUrl is like [For] but for a url string s. It extracts the hostname from s
-// and returns corresponding addrs from cache; or, resolving it, if empty.
-func ForUrl(s string) []netip.Addr {
-	u, err := url.Parse(s) // works if s is mere hostname; ex: example.com
-	if err != nil {
-		return For(s) // fallback on hostOrIP
-	}
-	return For(u.Hostname())
 }
 
 // Ptr returns hostnames from the ipmap cache, given an IP address.
@@ -127,36 +107,10 @@ func Confirmed(hostOrIP string) (zz netip.Addr) {
 // CachedAddrs returns addresses for hostOrIP from cache. Use Resolve() to bypass cache.
 func CachedAddrs(hostOrIP string) []netip.Addr {
 	ipset := ipm.GetAny(hostOrIP)
-	if ipset != nil && !ipset.Empty() {
+	if ipset != nil || !ipset.Empty() {
 		return ipset.Addrs()
 	}
 	return nil
-}
-
-// cache adds a set of addresses for host to the cache.
-func cache(host string, addrs []netip.Addr) bool {
-	if len(host) <= 0 || len(addrs) <= 0 {
-		return false
-	}
-	s := ipm.AddMany(host, addrs)
-	return s != nil && !s.Empty()
-}
-
-// cache2 is like cache but	for qname and IPs in dns.Msg a, if any.
-func cache2(a *dns.Msg) bool {
-	if a == nil {
-		return false
-	}
-	if !xdns.HasAnyAnswer(a) {
-		return false
-	}
-	qname := xdns.QName(a)
-	host, err := xdns.NormalizeQName(qname)
-	if err != nil {
-		log.E("dialers: ips: cachefrom: normalize qname %s err: %v", qname, err)
-		return false
-	}
-	return cache(host, xdns.IPs(a))
 }
 
 // Mapper is a hostname to IP (a/aaaa) resolver for the network engine; may be nil.
@@ -168,9 +122,7 @@ func Mapper(m ipmap.IPMapper) {
 
 func Clear() {
 	// do not need to handle panics w/ core.Recover
-	ipm.Clear()      // does not clear Selfhost, Systemhost (protected)
-	ippPins.Clear()  // clear dialer-id pins
-	ttlcache.Clear() // clear desync TTL cache
+	ipm.Clear() // does not clear UidSelf, UidSystem (protected)
 }
 
 // Confirm3 marks addr as preferred for hostOrIP

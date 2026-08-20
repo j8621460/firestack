@@ -55,7 +55,7 @@ type RpnAcc interface {
 	x.RpnAcc
 	ProviderID() string // x.RpnWg, x.RpnPro, x.RpnAmz, x.RpnWin
 	MultiCountry() bool
-	Conf(key string) (string, *x.RpnServer, error)
+	Conf(key string) (string, error)
 }
 
 var _ RpnAcc = (*WsClient)(nil)
@@ -86,15 +86,12 @@ type RpnStateless struct {
 	RpnUpdateless
 }
 
-func (RpnStateless) Updated() int64                               { return neverEver.UnixMilli() }
-func (RpnStateless) State() ([]byte, error)                       { return nil, errRpnStateless }
-func (RpnStateless) Conf(cc string) (string, *x.RpnServer, error) { return "", nil, errRpnStateless }
-func (RpnStateless) Entitlement() (x.RpnEntitlement, error)       { return nil, errRpnStateless }
+func (RpnStateless) State() (*x.Gobyte, error)      { return nil, errRpnStateless }
+func (RpnStateless) Conf(cc string) (string, error) { return "", errRpnStateless }
 
 type RpnUpdateless struct{}
 
-func (RpnUpdateless) Ops() *x.RpnOps                   { return nil }
-func (RpnUpdateless) Update(*x.RpnOps) ([]byte, error) { return nil, errRpnUpdateless }
+func (RpnUpdateless) Update() (*x.Gobyte, error) { return nil, errRpnUpdateless }
 
 type RpnMultiCountryServers struct {
 	all []x.RpnServer
@@ -113,7 +110,7 @@ func (s *RpnMultiCountryServers) Len() int {
 	return len(s.all)
 }
 
-func (s *RpnMultiCountryServers) Json() ([]byte, error) {
+func (s *RpnMultiCountryServers) Json() (*x.Gobyte, error) {
 	if s == nil || len(s.all) <= 0 {
 		return nil, fmt.Errorf("rpn: no servers")
 	}
@@ -122,14 +119,14 @@ func (s *RpnMultiCountryServers) Json() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rpn: json: %w", err)
 	}
-	return b, nil
+	return x.BytesOf(b), nil
 }
 
 func WinEndpoints() (v4 []netip.AddrPort, v6 []netip.AddrPort, err error) {
 	var v4ok, v6ok bool
 	for _, u := range []string{svchost, wsMyIp2, wsMyIp} {
 		// svchost is a host, but url.Parse will work
-		for _, ip := range dialers.ForUrl(u) {
+		for _, ip := range dialers.ResolveForUrl(u) {
 			if ipok(ip) {
 				if ip.Is4() {
 					v4 = append(v4, netip.AddrPortFrom(ip, uint16(80)))

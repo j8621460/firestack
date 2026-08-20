@@ -18,17 +18,13 @@ package x64
 import (
 	"context"
 	"errors"
-	"maps"
 	"net"
 	"sync"
-	"sync/atomic"
 
 	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/dialers"
 	"github.com/celzero/firestack/intra/dnsx"
 	"github.com/celzero/firestack/intra/log"
-	"github.com/celzero/firestack/intra/protect/ipmap"
-	"github.com/celzero/firestack/intra/settings"
 	"github.com/celzero/firestack/intra/xdns"
 	"github.com/miekg/dns"
 )
@@ -53,7 +49,6 @@ var (
 	errEmpty        = errors.New("missing dns64 IPv6 prefixes")
 	errNotFound     = errors.New("resolver did not send dns64 ipv6 prefixes")
 	errNoSuchServer = errors.New("resolver not registered")
-	errNoMapper     = errors.New("no dns64 ipmapper")
 
 	emptyStruct = struct{}{}
 
@@ -64,88 +59,26 @@ type dns64 struct {
 	sync.RWMutex
 
 	ctx context.Context
-	// dns-resolver -> nat64-ips (never contains zero net.IPNet)
-	ip64 map[string][]net.IPNet
+	// dns-resolver -> nat64-ips
+	ip64 map[string][]*net.IPNet
 	// dns-resolver -> unique nat64-ips
 	uniqIP64 map[string]map[string]struct{}
-
-	// mapper for dns64 queries; set via kickstart, may be nil
-	mapper ipmap.IPMapper
-
-	paused atomic.Bool
 }
 
 func newDns64(ctx context.Context) *dns64 {
 	d := &dns64{
 		ctx:      ctx,
-		ip64:     make(map[string][]net.IPNet),
+		ip64:     make(map[string][]*net.IPNet),
 		uniqIP64: make(map[string]map[string]struct{}),
 	}
-	settings.PtMode.On(ctx, func(_ int32) {
-		d.pauseOrResume()
-	})
-	dialers.IPChanges().On(ctx, func(_ string) {
-		d.pauseOrResume()
-	})
 	core.Gx("dns64.init", d.init)
 	return d
-}
-
-// kickstart wires in the IPMapper (usually the dnsx resolver) used for
-// dns64 queries. It is called once the resolver is up, since the resolver
-// itself needs this dns64 (see dnsx.NewResolver).
-func (d *dns64) kickstart(m ipmap.IPMapper) {
-	if m == nil {
-		log.W("dns64: kickstart: nil mapper")
-		return
-	}
-	d.Lock()
-	d.mapper = m
-	d.Unlock()
-	log.I("dns64: kickstart: mapper ok? %t", m != nil)
-}
-
-func (d *dns64) ipmapper() ipmap.IPMapper {
-	d.RLock()
-	defer d.RUnlock()
-	return d.mapper
-}
-
-func (d *dns64) pauseOrResume() {
-	pt := settings.PtMode.Load()
-	has6 := dialers.Use6()
-	if pt == settings.PtModeNone {
-		if d.paused.CompareAndSwap(false, true) {
-			log.I("dns64: flow: disabled; pausing...")
-		}
-	} else if pt == settings.PtModeAuto && !has6 {
-		// in auto mode, but no v6; pause 6to4 translations
-		// in force 4 via 6 mode; 6to4 does not make sense
-		if d.paused.CompareAndSwap(false, true) {
-			log.I("dns64: flow: auto; no ipv6; pausing...")
-		}
-	} else {
-		if d.paused.CompareAndSwap(true, false) {
-			dormant := d.allIP64s()
-			log.I("dns64: flow: forced or have ipv6? %t; resuming %d resolver(s)...", has6, len(dormant))
-			for id := range dormant {
-				readded := !d.AddResolver(id)
-				logwif(!readded)("dns64: re-add resolver(%s); ok? %t", id, readded)
-			}
-		}
-	}
 }
 
 func (d *dns64) init() {
 	if err := d.ofLocal464(); err != nil { // unlikely
 		log.W("dns64: err reg local(%v)", err)
 	}
-}
-
-func (d *dns64) allIP64s() map[string][]net.IPNet {
-	d.RLock()
-	defer d.RUnlock()
-	return maps.Clone(d.ip64)
 }
 
 func questionArpa64() *dns.Msg {
@@ -155,54 +88,33 @@ func questionArpa64() *dns.Msg {
 }
 
 // register adds a new dns resolver to the dns64 map; thread-safe.
-func (d *dns64) register(id string) (paused bool) {
+func (d *dns64) register(id string) {
 	d.Lock()
+	defer d.Unlock()
 	if l, ok := d.ip64[id]; ok {
 		log.W("dns64: overwrite existing ip64(%v) for resolver(%s)", l, id)
 	}
-	d.ip64[id] = make([]net.IPNet, 0)
+	d.ip64[id] = make([]*net.IPNet, 0)
 	d.uniqIP64[id] = make(map[string]struct{})
-	d.Unlock()
-
-	return d.isPaused()
 }
 
-func (d *dns64) isPaused() bool {
-	return d.paused.Load()
-}
-
-func (d *dns64) AddResolver(r string) (ok bool) {
-	id := id64(r)
+func (d *dns64) AddResolver(id, r string) (ok bool) {
 	switch id {
+	case dnsx.OverlayResolver:
+		return d.ofOverlay() == nil
 	case dnsx.Local464Resolver:
 		return d.ofLocal464() == nil
-	case dnsx.StdlibResolver:
-		return d.ofStdlib() == nil
-	case dnsx.UnderlayResolver:
-		// stdlib must be re-calc on network changes; addition of a new
-		// dnsx.System resolver is a proxy for a network change, so re-calc stdlib
-		d.ofStdlib()
 	}
 
-	if !d.register(id) { // re-register to start with a clean slate
-		log.VV("dns64: skipping query phase for resolver(%s); paused...", r)
-		return
-	}
+	d.register(id)
 
 	defer func() {
 		if !ok {
-			// remove previous id-related values on all errors, regardless.
 			d.RemoveResolver(id)
 		}
 	}()
 
-	m := d.ipmapper()
-	if m == nil {
-		log.W("dns64: resolver(%s): no ipmapper; skipping query phase", id)
-		return
-	}
-
-	ans, err := dialers.Query(m, arpa64, r)
+	ans, err := dialers.Query(arpa64, r)
 
 	if err != nil || ans == nil || !xdns.HasAnyAnswer(ans) {
 		log.W("dns64: udp: could not query %s[%s] or empty ans; err %v", r, id, err)
@@ -211,7 +123,7 @@ func (d *dns64) AddResolver(r string) (ok bool) {
 
 	if ans.Truncated { // should never be the case for DOH, ODOH, DOT
 		// else if: returned response is truncated dns ans, retry over tcp
-		ans, err = dialers.Query(m, arpa64, r)
+		ans, err = dialers.Query(arpa64, r)
 		if err != nil {
 			log.W("dns64: tcp: could not query resolver %s[%s]; err %v", r, id, err)
 			return
@@ -231,16 +143,14 @@ func (d *dns64) AddResolver(r string) (ok bool) {
 		}
 	}
 
-	err = d.add(id, ips)
+	if err := d.add(id, ips); err == nil {
+		return true
+	}
 
-	ok = err == nil
-
-	logwif(!ok)("dns64: failed to add %s[%s] ips(%v); err %v", r, id, ips, err)
 	return
 }
 
 func (d *dns64) RemoveResolver(id string) bool {
-	id = id64(id)
 	d.Lock()
 	defer d.Unlock()
 	delete(d.ip64, id)
@@ -277,13 +187,13 @@ func (d *dns64) eval(network string, force64 bool, ansin *dns.Msg, r, uid string
 	ip64 := d.get(id)
 	if len(ip64) <= 0 {
 		if ip64 = d.get(dnsx.UnderlayResolver); len(ip64) <= 0 {
-			if ip64 = d.get(dnsx.StdlibResolver); len(ip64) <= 0 {
-				// 64 prefix from Local646Resolver to be removed before egressing tunnel
-				// see: natpt.go:X64 and alg.go:maybeUndoLocalNat64Locked
+			if ip64 = d.get(dnsx.OverlayResolver); len(ip64) <= 0 {
 				ip64 = d.get(dnsx.Local464Resolver)
 			}
 		}
 		log.D("dns64: attempt underlay/local464 resolver [%s@%s] ip64 (ad? %t) w len(%d)", r, uid, hasauth, len(ip64))
+	} else {
+		log.V("dns64: for %s, no resolver id(%s[%s]) registered (ad? %t)", uid, r, id, hasauth)
 	}
 
 	ans4, err := d.query64(network, ansin, r, uid)
@@ -330,13 +240,7 @@ func (d *dns64) query64(network string, msg6 *dns.Msg, r, uid string) (*dns.Msg,
 
 	q4 := xdns.QName(msg4)
 
-	m := d.ipmapper()
-	if m == nil {
-		return nil, errNoMapper
-	}
-
-	// uid may be UNKNOWN_UID_STR if alg has "split" disabled.
-	res, err := dialers.QueryFor(m, msg4, uid, r)
+	res, err := dialers.QueryFor(msg4, uid, r)
 
 	hasAns := xdns.HasAnyAnswer(res)
 	log.D("dns64: for %s over %s: %s q(%s) / a(%t) / e(%v) / e-not-nil(%t)",
@@ -350,7 +254,7 @@ func (d *dns64) query64(network string, msg6 *dns.Msg, r, uid string) (*dns.Msg,
 	// res.Truncated never likely happens w/ DOH, ODOH, DOT?
 	if res.Truncated && proto != dnsx.NetTypeTCP {
 		// else if: returned response is truncated dns ans, retry over tcp
-		res, err = dialers.QueryFor(m, msg4, uid, r)
+		res, err = dialers.QueryFor(msg4, uid, r)
 
 		hasAns = xdns.HasAnyAnswer(res)
 		log.D("dns64: tcp: for %s over %s: q(%s) / a(%d) / e(%v) / e-not-nil(%t)",
@@ -364,21 +268,9 @@ func (d *dns64) query64(network string, msg6 *dns.Msg, r, uid string) (*dns.Msg,
 	return res, err
 }
 
-func (d *dns64) ofStdlib() error {
-	if d.register(dnsx.StdlibResolver) {
-		log.VV("dns64: skipping query phase for stdlib; paused...")
-		return nil
-	}
-	// in loopback mode, net.DefaultResolver will be routed back into
-	// the tunnel and not in fact sent out to the default gateway
-	if settings.Loopingback.Load() {
-		log.I("dns64: skipping query phase for stdlib; looping back...")
-		return nil
-	}
-
-	// AAAA query for ipv4only.arpa to stdlib resolver
+func (d *dns64) ofOverlay() error {
 	ips, err := net.DefaultResolver.LookupIP(d.ctx, "ip6", dnsx.Rfc7050WKN)
-	log.I("dns64: ipv4only.arpa w stdlib network resolver")
+	log.I("dns64: ipv4only.arpa w underlying network resolver")
 
 	if err != nil {
 		return err
@@ -388,7 +280,8 @@ func (d *dns64) ofStdlib() error {
 		return errNotFound
 	}
 
-	return d.add(dnsx.StdlibResolver, ips)
+	d.register(dnsx.OverlayResolver)
+	return d.add(dnsx.OverlayResolver, ips)
 }
 
 func (d *dns64) ofLocal464() error {
@@ -403,6 +296,7 @@ func (d *dns64) ofLocal464() error {
 
 // add adds the nat64 prefixes to the dns64 map; thread-safe.
 func (d *dns64) add(serverid string, nat64 []net.IP) error {
+
 	if len(nat64) <= 0 {
 		log.W("dns64: no nat64 ips for %s", serverid)
 		return errEmpty
@@ -435,7 +329,7 @@ func (d *dns64) add(serverid string, nat64 []net.IP) error {
 		}
 
 		endBit := endByte * 8
-		ipxx := net.IPNet{}
+		ipxx := new(net.IPNet)
 		// prefix ipv6 until the endByte, followed by all-zeros
 		// 64:ff9b:1::WKA -> 64:ff9b:1::
 		ipxx.IP = append(ipv6[:endByte], net.IPv6zero[endByte:]...)
@@ -456,18 +350,13 @@ func (d *dns64) add(serverid string, nat64 []net.IP) error {
 	}
 }
 
-func (d *dns64) get(serverid string) []net.IPNet {
+func (d *dns64) get(serverid string) []*net.IPNet {
 	d.RLock()
 	defer d.RUnlock()
 	return d.ip64[serverid]
 }
 
-func (d *dns64) addNat64Prefix(id string, ipxx net.IPNet) error {
-	if xdns.IsZeroPrefix(ipxx) {
-		log.W("dns64: id(%s) has zero nat64 prefix", id)
-		return errEmpty
-	}
-
+func (d *dns64) addNat64Prefix(id string, ipxx *net.IPNet) error {
 	d.Lock()
 	defer d.Unlock()
 
@@ -484,9 +373,9 @@ func (d *dns64) addNat64Prefix(id string, ipxx net.IPNet) error {
 	if !exists {
 		ip64 = append(ip64, ipxx)
 		uniq[ipxxstr] = emptyStruct
-		log.I("dns64: add ipnet [%s] for server(%s)", ipxxstr, id)
+		log.I("dns64: add ipnet [%s] for server(%s)", ipxx, id)
 	} else {
-		log.D("dns64: prefix6(%v) for server(%s) exists!", ipxxstr, id)
+		log.D("dns64: prefix6(%v) for server(%s) exists!", id, ipxx)
 	}
 	// nil / empty lists are valid values in map[string][]*net.IP
 	d.ip64[id] = ip64

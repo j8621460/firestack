@@ -8,7 +8,6 @@ package multihost
 
 import (
 	"fmt"
-	"maps"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -24,7 +23,6 @@ type MHMap struct {
 	uniq       map[*MH]struct{}
 	byIpp      map[netip.AddrPort]*MH // ip:port => MH
 	byHostport map[string]*MH         // host:port => MH
-	byAddr     map[netip.Addr]int     // addr => refcount; for O(1) HasAddr
 }
 
 func (m *MHMap) All() (all []*MH) {
@@ -38,38 +36,6 @@ func (m *MHMap) All() (all []*MH) {
 		all = append(all, h)
 	}
 	return
-}
-
-func (m *MHMap) Endpoints() (all []string) {
-	if m == nil {
-		return
-	}
-
-	m.RLock()
-	defer m.RUnlock()
-	for n := range m.byHostport {
-		all = append(all, n)
-	}
-	if len(all) <= 0 {
-		for ipp := range m.byIpp {
-			all = append(all, ipp.String())
-		}
-	}
-	return
-}
-
-// HasAddr returns true if any endpoint in this map contains the given address.
-// It looks up byIpp directly for efficiency rather than iterating through all MHs.
-// HasAddr returns true if any endpoint in this map contains the given address.
-// Uses the byAddr index for O(1) lookup.
-func (m *MHMap) HasAddr(addr netip.Addr) bool {
-	if m == nil || !addr.IsValid() {
-		return false
-	}
-	m.RLock()
-	defer m.RUnlock()
-	_, ok := m.byAddr[addr]
-	return ok
 }
 
 func (m *MHMap) Get(hostOrIpport string) (h *MH, _ error) {
@@ -131,8 +97,6 @@ func (m *MHMap) putLocked(h *MH) (ok bool) {
 		m.uniq[h] = struct{}{}
 		for _, ipp := range ipps {
 			m.byIpp[ipp] = h
-			// increment refcount for each unique addr (ignore port)
-			m.byAddr[ipp.Addr()]++
 		}
 		for _, name := range names {
 			m.byHostport[name] = h
@@ -166,13 +130,6 @@ func (m *MHMap) delLocked(h *MH) (ok bool) {
 		for _, ip := range ipps {
 			if x := m.byIpp[ip]; x == h {
 				delete(m.byIpp, ip)
-				// decrement refcount for each unique addr (ignore port)
-				a := ip.Addr()
-				if m.byAddr[a] <= 1 {
-					delete(m.byAddr, a)
-				} else {
-					m.byAddr[a]--
-				}
 			}
 		}
 		for _, name := range names {
@@ -206,23 +163,14 @@ func (m *MHMap) Refresh() (n int64) {
 		return
 	}
 
-	hs := make([]*MH, 0, len(m.uniq))
-	for h := range m.cloneset() {
-		hs = append(hs, h)
-	}
-
-	for _, h := range hs {
-		m.Del(h)
+	m.Lock()
+	defer m.Unlock()
+	for h := range m.uniq {
+		m.delLocked(h)
 		n += int64(h.Refresh())
-		m.Put(h)
+		m.putLocked(h)
 	}
 	return
-}
-
-func (m *MHMap) cloneset() map[*MH]struct{} {
-	m.RLock()
-	defer m.RUnlock()
-	return maps.Clone(m.uniq)
 }
 
 func (m *MHMap) MaybeRefresh() (n int64) {
@@ -230,35 +178,14 @@ func (m *MHMap) MaybeRefresh() (n int64) {
 		return
 	}
 
-	var stale []*MH
-	for h := range m.cloneset() {
-		if _, old := h.stale(); old {
-			stale = append(stale, h)
+	m.Lock()
+	defer m.Unlock()
+	for h := range m.uniq {
+		if _, stale := h.stale(); stale {
+			m.delLocked(h)
+			n += int64(h.Refresh())
+			m.putLocked(h)
 		}
-	}
-
-	if len(stale) == 0 {
-		return
-	}
-
-	for _, h := range stale {
-		m.Del(h)
-		n += int64(h.Refresh())
-		m.Put(h)
-	}
-	return
-}
-
-// Build triggers resolution of names to IPs for every endpoint in this map.
-// Endpoints that already have addresses resolve in the background
-// (non-blocking); the rest resolve synchronously. It returns the total number
-// of addresses across all endpoints.
-func (m *MHMap) Build() (n int64) {
-	if m == nil {
-		return
-	}
-	for h := range m.cloneset() {
-		n += int64(h.Build())
 	}
 	return
 }
@@ -301,6 +228,5 @@ func NewMap(id string) *MHMap {
 		uniq:       make(map[*MH]struct{}),
 		byIpp:      make(map[netip.AddrPort]*MH),
 		byHostport: make(map[string]*MH),
-		byAddr:     make(map[netip.Addr]int),
 	}
 }

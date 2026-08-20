@@ -28,15 +28,17 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
-	"github.com/celzero/firestack/intra/core/wire"
 	"github.com/celzero/firestack/intra/dialers"
 	"github.com/celzero/firestack/intra/dnsx"
 	"github.com/celzero/firestack/intra/ipn"
@@ -50,6 +52,8 @@ import (
 
 const mktunTimeout = 8 * time.Second
 
+var bar = core.NewKeyedBarrier[*x.NetStat, string](30 * time.Second)
+
 var (
 	errNoStatCache = errors.New("netstat: stat in cache is nil")
 	errClosed      = errors.New("tunnel closed for business")
@@ -59,12 +63,13 @@ var (
 type Bridge interface {
 	Listener
 	Controller
+	Console
 }
 
 // Listener receives usage statistics when a UDP or TCP socket is closed,
 // or a DNS query is completed.
 type Listener interface {
-	FlowListener
+	SocketListener
 	DNSListener
 	ServerListener
 	ProxyListener
@@ -119,36 +124,29 @@ type Tunnel interface {
 }
 
 type rtunnel struct {
-	ctx  context.Context
-	done context.CancelFunc
-
-	t   core.Volatile[tunnel.Tunnel]
-	bar *core.Barrier[*x.NetStat, string]
-
+	t        *core.Volatile[tunnel.Tunnel]
+	ctx      context.Context
+	done     context.CancelFunc
 	handlers netstack.GConnHandler
 	proxies  ipn.Proxies
 	resolver dnsx.Resolver
 	services rnet.Services
-
-	linkmtu atomic.Int32
-
-	closed atomic.Bool
-	once   sync.Once
+	linkmtu  *core.Volatile[int]
+	closed   atomic.Bool
+	once     sync.Once
 }
-
-var statttl = 30 * time.Second
 
 var _ Tunnel = (*rtunnel)(nil)
 
 type clogAdapter struct {
-	b Console
+	b Bridge
 }
 
 var _ log.Console = (*clogAdapter)(nil)
 
 func (l *clogAdapter) Log(lvl log.LogLevel, msg log.Logmsg) {
 	if bdg := l.b; bdg != nil {
-		bdg.Log(int32(lvl), msg) // adopt the log message
+		bdg.Log(int32(lvl), x.StrOf(msg)) // adopt the log message
 	}
 }
 
@@ -191,8 +189,35 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
 
 	const dualstack = settings.IP46
 
-	// dns64 queries are deferred (see dns64.AddResolver), by which time the
-	// resolver below is wired in via natpt.Kickstart.
+	logch := make(chan bool, 1)
+	crashch := make(chan bool, 1)
+	go func() {
+		logfd := false
+		if r, c, err := log.NewFilebased(); err == nil {
+			closeall := func() {
+				core.Close(c)
+				core.Close(r)
+			}
+			if logfd = bdg.LogFD(int(r.Fd())); logfd {
+				log.SetConsole(ctx, c)
+				context.AfterFunc(ctx, closeall)
+			} else {
+				closeall()
+			}
+		}
+		if !logfd {
+			log.SetConsole(ctx, &clogAdapter{bdg})
+		}
+		log.D("tun: <<< new >>>; log out ok; fd? %t", logfd)
+		logch <- logfd
+	}()
+
+	go func() {
+		crashfd := pipeCrashOutput(bdg)
+		crashch <- crashfd
+		log.D("tun: <<< new >>>; crash out ok; fd? %t", crashfd)
+	}()
+
 	natpt := x64.NewNatPt2(ctx)
 	proxies := ipn.NewProxifier(ctx, dualstack, linkmtu, bdg, bdg)
 	services := rnet.NewServices(ctx, proxies, bdg, bdg)
@@ -202,21 +227,23 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
 			proxies == nil, services == nil)
 	}
 
-	resolver := dnsx.NewResolver(ctx, fakedns, dtr, bdg, natpt)
-
 	// kickstart may call into ProxyFor which has a multi-second wait time
 	// when proxies are not found
-	if err := dtr.kickstart(proxies, resolver); err != nil {
+	if err := dtr.kickstart(proxies); err != nil {
 		log.W("tun: <<< new >>>; kickstart err(%v)", err)
 		return nil, err
 	}
 
-	// wire the resolver into natpt for dns64; must precede resolver.Add,
-	// which may kick off dns64.AddResolver queries
-	natpt.Kickstart(resolver)
+	log.D("tun: <<< new >>>; default dns: ok")
 
-	log.D("tun: <<< new >>>; proxies, svcs, bootstrap: ok")
+	logfd := <-logch
+	crashfd := <-crashch
 
+	log.ConsoleReady(ctx)
+
+	log.D("tun: <<< new >>>; logger, proxies, svcs, bootstrap: ok; fds (log? %t / crash? %t)", logfd, crashfd)
+
+	resolver := dnsx.NewResolver(ctx, fakedns, dtr, bdg, natpt)
 	resolver.Add(newGoosTransport(ctx, proxies))            // os-resolver; fixed
 	resolver.Add(newBlockAllTransport())                    // fixed
 	resolver.Add(newFixedTransport())                       // fixed
@@ -226,8 +253,8 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
 
 	log.D("tun: <<< new >>>; resolvers: ok")
 
-	dialers.IPProtos(dualstack) // assume dual-stack
-	dialers.Mapper(resolver)    // namespace aware os-resolver for pkg dialers
+	dialers.IPProtos(dualstack)           // assume dual-stack
+	addIPMapper(ctx, resolver, dualstack) // namespace aware os-resolver for pkg dialers
 
 	var src []netip.Prefix
 	for s := range strings.SplitSeq(ifaddrs, ",") {
@@ -263,24 +290,19 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
 	// TODO: err on reverser errors too?
 	rerr := proxies.Reverser(revhdl)
 
-	rt := &rtunnel{
-		bar:      core.NewKeyedBarrier[*x.NetStat, string](ctx, "t.stat.bar", statttl),
+	t = &rtunnel{
+		t:        core.NewVolatile[tunnel.Tunnel](gt),
 		ctx:      ctx,
 		done:     cancel,
 		handlers: hdl,
 		proxies:  proxies,
 		resolver: resolver,
 		services: services,
+		linkmtu:  core.NewVolatile(linkmtu),
 	}
-	rt.t.Store(gt)
-	rt.linkmtu.Store(int32(linkmtu))
 
-	context.AfterFunc(ctx, wire.Pool.Clear)
-	context.AfterFunc(ctx, dialers.Clear)
-	context.AfterFunc(ctx, ipn.ClearIPMeta)
-	context.AfterFunc(ctx, func() { dialers.Mapper(nil) })
 	log.I("tun: <<< new >>>; tunnel ok; reverser? %v", rerr)
-	return rt, nil
+	return t, nil
 }
 
 func (t *rtunnel) Disconnect() {
@@ -298,9 +320,8 @@ func (t *rtunnel) Disconnect() {
 }
 
 func (t *rtunnel) SetLinkMtu(linkmtu int) (didchange bool) {
-	mtu32 := int32(linkmtu)
-	prev := t.linkmtu.Swap(mtu32)
-	mtudiff := prev != mtu32
+	prev := t.linkmtu.Swap(linkmtu)
+	mtudiff := prev != linkmtu
 	logiif(mtudiff)("tun: set link mtu; set(%d) <= prev(%d); refresh protos? %t", linkmtu, prev, mtudiff)
 	if mtudiff {
 		core.Gx("i.setLinkMtuRefresh", func() {
@@ -320,10 +341,9 @@ func (t *rtunnel) SetLinkAndRoutes2(fd, tunmtu, linkmtu, engine int) error {
 		return errClosed
 	}
 
-	mtu32 := int32(linkmtu)
 	tunnel := t.t.Load()
 
-	mtudiff := t.linkmtu.Swap(mtu32) != mtu32
+	mtudiff := t.linkmtu.Swap(linkmtu) != linkmtu
 	l3 := settings.L3(engine)
 	l3diff := dialers.IPProtos(l3)
 
@@ -343,9 +363,6 @@ func (t *rtunnel) SetLinkAndRoutes2(fd, tunmtu, linkmtu, engine int) error {
 			t.proxies.RefreshProto(l3, linkmtu, false /*force*/)
 		})
 	}
-
-	logei(err)("tun: <<< set link and route >>>; fd: %d, tunmtu: %d, linkmtu: %d, engine: %s; l3diff? %t, mtudiff? %t; err? %v",
-		fd, tunmtu, linkmtu, engine, l3diff, mtudiff, err)
 
 	return err
 }
@@ -377,9 +394,6 @@ func (t *rtunnel) Restart(fd, linkmtu, tunmtu, engine int) error {
 	old := t.t.Load()
 	old.Disconnect() // could have been disconnected by the client already
 
-	// handlers are shared across restarts; reset them
-	t.handlers.Reset()
-
 	gt, revhdl, err := tunnel.NewGTunnel(t.ctx, fd, tunmtu, dualstack, t.handlers)
 
 	if err != nil || gt == nil || core.IsNil(gt) {
@@ -387,10 +401,10 @@ func (t *rtunnel) Restart(fd, linkmtu, tunmtu, engine int) error {
 		return core.OneErr(err, errMakeTunnel)
 	}
 
+	// TODO: CompareAndSwap
 	if !t.t.Cas(old, gt) { // gt never nil
 		gt.Disconnect() // close the new tunnel
-		log.E("tun: <<< restart >>>; for: %d (mtu: %d), cas failed; old %X, new %X", fd, tunmtu, old, gt)
-		return nil
+		log.W("tun: <<< restart >>>; for: %d (mtu: %d), cas failed; old %X, new %X", fd, tunmtu, old, gt)
 	}
 
 	// TODO: err on reverser errors too?
@@ -460,7 +474,7 @@ func (t *rtunnel) Stat() (*x.NetStat, error) {
 		return t.stat()
 	}
 
-	v, err := t.bar.DoIt("stat", func() (*x.NetStat, error) {
+	v, err := bar.DoIt("stat", func() (*x.NetStat, error) {
 		return t.stat()
 	})
 
@@ -497,6 +511,7 @@ func (t *rtunnel) stat() (*x.NetStat, error) {
 	out.RDNSIn.OwnTunFd = settings.OwnTunFd.Load()
 	out.RDNSIn.PortForward = settings.PortForward.Load()
 	out.RDNSIn.Transparency = settings.EndpointIndependentFiltering.Load()
+	out.RDNSIn.PanicTest = settings.PanicAtRandom.Load()
 	out.RDNSIn.SetUserAgent = settings.SetUserAgent.Load()
 	out.RDNSIn.SystemDNSForUndelegated = settings.SystemDNSForUndelegatedDomains.Load()
 	out.RDNSIn.DefaultDNSAsFallback = settings.DefaultDNSAsFallback.Load()
@@ -512,20 +527,64 @@ func (t *rtunnel) stat() (*x.NetStat, error) {
 	pt := settings.Mode2String("pt", settings.PtMode.Load())
 	out.RDNSIn.TunMode = fmt.Sprintf("%s;%s;%s", firewall, dns, pt)
 
+	var mm runtime.MemStats
+	runtime.ReadMemStats(&mm) // stw & expensive
+	out.GOSt.Alloc = core.FmtBytes(mm.Alloc)
+	out.GOSt.TotalAlloc = core.FmtBytes(mm.TotalAlloc)
+	out.GOSt.Sys = core.FmtBytes(mm.Sys)
+	out.GOSt.Lookups = int64(mm.Lookups)
+	out.GOSt.Mallocs = int64(mm.Mallocs)
+	out.GOSt.Frees = int64(mm.Frees)
+	out.GOSt.HeapAlloc = core.FmtBytes(mm.HeapAlloc)
+	out.GOSt.HeapSys = core.FmtBytes(mm.HeapSys)
+	out.GOSt.HeapIdle = core.FmtBytes(mm.HeapIdle)
+	out.GOSt.HeapInuse = core.FmtBytes(mm.HeapInuse)
+	out.GOSt.HeapReleased = core.FmtBytes(mm.HeapReleased)
+	out.GOSt.HeapObjects = int64(mm.HeapObjects)
+	out.GOSt.StackInuse = core.FmtBytes(mm.StackInuse)
+	out.GOSt.StackSys = core.FmtBytes(mm.StackSys)
+	out.GOSt.MSpanInuse = core.FmtBytes(mm.MSpanInuse)
+	out.GOSt.MSpanSys = core.FmtBytes(mm.MSpanSys)
+	out.GOSt.MCacheInuse = core.FmtBytes(mm.MCacheInuse)
+	out.GOSt.MCacheSys = core.FmtBytes(mm.MCacheSys)
+	out.GOSt.BuckHashSys = core.FmtBytes(mm.BuckHashSys)
+	out.GOSt.GCSys = core.FmtBytes(mm.GCSys)
+	out.GOSt.OtherSys = core.FmtBytes(mm.OtherSys)
+	out.GOSt.NextGC = core.FmtTimeNs(mm.NextGC)
+	out.GOSt.LastGC = core.FmtTimeNs(mm.LastGC)
+	out.GOSt.PauseSecs = core.Nano2Sec(mm.PauseTotalNs)
+	out.GOSt.NumGC = int32(mm.NumGC)
+	out.GOSt.NumForcedGC = int32(mm.NumForcedGC)
+	out.GOSt.GCCPUFraction = fmt.Sprintf("%0.4f", mm.GCCPUFraction)
+	out.GOSt.EnableGC = mm.EnableGC
+	out.GOSt.DebugGC = mm.DebugGC
+
+	out.GOSt.NumGoroutine = int64(runtime.NumGoroutine())
+	out.GOSt.NumCgo = int64(runtime.NumCgoCall())
+	out.GOSt.NumCPU = int64(runtime.NumCPU())
+
+	l, all, crash := core.RuntimeGotraceback()
+	out.GOSt.Trac = fmt.Sprintf("%d; all? %t; crash? %t", l, all, crash)
+
+	sm1, sm2 := core.RuntimeSecureMode()
+	uid := fmt.Sprintf("uid=%d", syscall.Getuid())
+	pid := fmt.Sprintf("pid=%d", syscall.Getpid())
+	sec := fmt.Sprintf("sec=%t/%t", sm1, sm2)
+	out.GOSt.Args = strings.Join(append(os.Args, uid, pid, sec), ";")
+	out.GOSt.Env = strings.Join(core.RuntimeEnviron(), ";")
+	out.GOSt.Pers, _ = os.Executable()
+
 	if r := t.resolver; r != nil {
-		out.RDNSIn.DNS64Pfx = "System:" + csv2ssv(r.GetNat64(x.System)) +
-			"\nGoos:" + csv2ssv(r.GetNat64(x.Goos)) +
-			"\nPreferred:" + csv2ssv(r.GetNat64(x.Preferred))
 		out.RDNSIn.DNSPreferred = fetchDNSInfo(r, x.Preferred)
 		out.RDNSIn.DNSDefault = fetchDNSInfo(r, x.Default)
 		out.RDNSIn.DNSSystem = fetchDNSInfo(r, x.System)
-		dns := make([]string, 0, 8)
-		if csv := r.LiveTransports(); len(csv) > 0 {
+		dns := make([]string, 0, 3)
+		if csv := r.LiveTransports().V(); len(csv) > 0 {
 			for tr := range strings.SplitSeq(csv, ",") {
 				dns = append(dns, fetchDNSInfo(r, tr))
 			}
 		}
-		out.RDNSIn.DNS = strconv.Itoa(len(dns)) + "\n" + strings.Join(dns, "\n")
+		out.RDNSIn.DNS = strconv.Itoa(len(dns)) + "\n" + strings.Join(dns, ";")
 		out.RDNSIn.ALG = t.resolver.S()
 	}
 	if p := t.proxies; p != nil {
@@ -546,7 +605,6 @@ func (t *rtunnel) stat() (*x.NetStat, error) {
 		}
 		out.RDNSIn.ProxyStatus = ss.Status
 	}
-
 	return out, nil
 }
 

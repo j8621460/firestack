@@ -27,9 +27,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
-	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/celzero/firestack/intra/core"
@@ -45,6 +43,9 @@ import (
 // adopted from: github.com/google/gvisor/blob/a244eff8ad/pkg/tcpip/link/fdbased/processors.go
 
 const maxForwarders = 8
+
+// disable log.wtf driven exit (it did not work the last time it was tested)
+const testwtf = false
 
 type fiveTuple struct {
 	srcAddr, dstAddr []byte
@@ -140,6 +141,8 @@ type processor struct {
 	sleeper     sleep.Sleeper
 	packetWaker sleep.Waker
 	closeWaker  sleep.Waker
+
+	testcrash bool
 }
 
 // start starts the processor goroutine; thread-safe.
@@ -162,28 +165,32 @@ func (p *processor) start(wg *sync.WaitGroup) {
 
 // deliverPackets delivers packets to the endpoint; thread-safe.
 func (p *processor) deliverPackets() {
-	locked := true
+	testpanic := !p.testcrash && settings.PanicAtRandom.Load() && rand10pc()
+	if testpanic {
+		defer core.Recover(core.Exit11, "ns.forwarder.deliverPackets")
+	}
+
 	p.mu.Lock()
-	defer func() {
-		if locked {
-			p.mu.Unlock()
-			locked = false
-		}
-	}()
+	defer p.mu.Unlock()
 	for p.pkts.Len() > 0 {
 		pkt := p.pkts.PopFront()
+		p.mu.Unlock()
 		if pkt != nil {
-			p.mu.Unlock()
-			locked = false
-
 			if !p.icmp.respond(pkt) {
 				p.e.InjectInbound(pkt.NetworkProtocolNumber, pkt)
 			}
 			pkt.DecRef()
-
-			p.mu.Lock()
-			locked = true
 		}
+		p.mu.Lock()
+	}
+
+	if testpanic {
+		panic("ns: tun: forwarder: deliverPackets rand10pc")
+	} else if testwtf && !p.testcrash && settings.PanicAtRandom.Load() && rand1pc() {
+		p.testcrash = true
+		core.RuntimeWtf("ns: tun: forwarder: test fatal\n")
+		var mu sync.Mutex
+		mu.Unlock() // ka-boom
 	}
 }
 
@@ -194,7 +201,7 @@ type supervisor struct {
 	icmp       *icmpResponder
 	seed       uint32
 	wg         sync.WaitGroup
-	sid        atomic.Int64 // tun fd for diagnostics
+	sid        *core.Volatile[int] // tun fd for diagnostics
 	ready      []bool
 }
 
@@ -204,12 +211,12 @@ func newSupervisor(e stack.InjectableLinkEndpoint, sid int) *supervisor {
 
 	m := &supervisor{
 		seed:       rand.Uint32(),
+		sid:        core.NewVolatile(sid),
 		ready:      make([]bool, maxForwarders),
 		processors: make([]processor, maxForwarders),
 		icmp:       &icmp,
 		wg:         sync.WaitGroup{},
 	}
-	m.note(sid)
 
 	m.wg.Add(maxForwarders)
 	for i := range m.processors {
@@ -224,13 +231,13 @@ func newSupervisor(e stack.InjectableLinkEndpoint, sid int) *supervisor {
 }
 
 // tunid returns a unique identifier (usually current tun fd); used for diagnostics only.
-func (m *supervisor) tunid() int64 {
+func (m *supervisor) tunid() int {
 	return m.sid.Load()
 }
 
 // note notes the new tun fd (used for diagnostics only).
 func (m *supervisor) note(sid int) {
-	m.sid.Store(int64(sid))
+	m.sid.Store(sid)
 }
 
 // start starts the processor goroutines if the processor manager is configured
@@ -242,10 +249,9 @@ func (m *supervisor) start() {
 	if m.canDeliverInline() {
 		return
 	}
-	sid := strconv.FormatInt(m.tunid(), 10)
 	for i := range m.processors {
 		p := &m.processors[i]
-		core.Gx1("ns.forwarder.start."+strconv.Itoa(i)+"."+sid, p.start, &m.wg)
+		core.Gx1("ns.forwarder.start", p.start, &m.wg)
 	}
 }
 
@@ -300,9 +306,7 @@ func (m *supervisor) queuePacket(pkt *stack.PacketBuffer, hasEthHeader bool) {
 	}
 	// despite uint32, pIdx goes negative? github.com/celzero/firestack/issues/59
 	// go.dev/ref/spec#Integer_overflow?
-	if pIdx >= sz {
-		// pIdx = hash % sz is always < sz, so >= sz is unreachable today;
-		// the guard is defensive against a future change that skips the mod.
+	if pIdx > sz {
 		log.W("ns: tun(%d): forwarder: invalid processor index %d, %s", sid, pIdx, tup)
 		pIdx = 0
 	}
@@ -331,8 +335,7 @@ func (m *supervisor) stop() {
 		}
 		m.wg.Wait()
 	} // else: no goroutines to stop or wait for.
-	log.D("ns: tun(%d): forwarder: stopped %d procs in %s",
-		sid, len(m.processors), core.FmtTimeAsPeriod(start))
+	log.D("ns: tun(%d): forwarder: stopped %d procs in %s", sid, len(m.processors), core.FmtTimeAsPeriod(start))
 }
 
 // wakeReady wakes up all processors that have a packet queued. If there is only

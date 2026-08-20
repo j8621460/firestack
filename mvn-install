@@ -22,11 +22,9 @@ mvn install:install-file \
     -Dversion=${VERSION} \
     -DgroupId=${GROUP} \
     -DartifactId=${ARTIFACT} \
-    -Dsources=${FSRC}
+    -Dsources=${SOURCES}
 #    -Dclassifier=${CLASSFULL} \
 
-# GROUP, VERSION, ARTIFACT env auto set by jitpack build server
-# FOUT, FSRC, PACK set in jitpack.yml
 # usage: docs.gradle.org/current/userguide/dependency_management.html
 # mvn install:install-file
 # -Dfile=firestack.aar
@@ -34,4 +32,12 @@ mvn install:install-file \
 # -Dversion=9744e5fad9
 # -DgroupId=com.github.celzero
 # -DartifactId=firestack
-# -Dsources=firestack-sources.jar
+# -Dsources=build/intra/tun2socks-sources.jar
+mvn -X install:install-file \
+    -Dfile=${FOUTDBG} \
+    -Dpackaging=${PACK} \
+    -Dversion=${VERSION} \
+    -DgroupId=${GROUP} \
+    -DartifactId=${ARTIFACT} \
+    -Dclassifier=${CLASSDBG} \
+    -Dsources=${SOURCES}

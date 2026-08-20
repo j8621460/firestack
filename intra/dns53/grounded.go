@@ -21,7 +21,7 @@ import (
 type grounded struct {
 	id     string
 	ipport string
-	status int32
+	status int
 }
 
 var _ dnsx.Transport = (*grounded)(nil)
@@ -58,39 +58,31 @@ func (t *grounded) Query(_ string, q *dns.Msg, smm *x.DNSSummary) (ans *dns.Msg,
 	return ans, err
 }
 
-func (t *grounded) ID() string {
-	return t.id
+func (t *grounded) ID() *x.Gostr {
+	return x.StrOf(t.id)
 }
 
-func (t *grounded) Type() string {
-	return dnsx.DNS53
+func (t *grounded) Type() *x.Gostr {
+	return x.StrOf(dnsx.DNS53)
 }
 
 func (t *grounded) P50() int64 {
 	return 0
 }
 
-func (t *grounded) GetAddr() string {
-	return t.ipport
-}
-
-func (t *grounded) Measure(mid string, n, seconds int32) *x.DNSMeasurement {
-	return dnsx.Perf(t, mid, n, seconds)
+func (t *grounded) GetAddr() *x.Gostr {
+	return x.StrOf(t.ipport)
 }
 
 func (t *grounded) GetRelay() x.Proxy {
 	return nil
 }
 
-func (t *grounded) Relaying() bool {
-	return false
-}
-
 func (t *grounded) IPPorts() []netip.AddrPort {
 	return dnsx.NoIPPort
 }
 
-func (t *grounded) Status() int32 {
+func (t *grounded) Status() int {
 	return t.status
 }
 

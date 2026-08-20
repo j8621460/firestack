@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -43,13 +42,12 @@ type socks5 struct {
 
 	// mutable fields below
 
-	status atomic.Int32 // SOK, SKO, END
+	status *core.Volatile[int] // SOK, SKO, END
 }
 
 type socks5handler struct {
-	// not used; see dial, TCPHandle, and UDPHandle
-	tx.DefaultHandle
-	px core.MutexValue[ipn.Proxy]
+	*tx.DefaultHandle
+	px *core.Volatile[ipn.Proxy]
 }
 
 // newSocks5Server creates a new socks5 server with the given id, url, controller, and listener.
@@ -82,22 +80,25 @@ func newSocks5Server(id, x string, ctl protect.Controller, listener ServerListen
 
 	// unused in our case; usage: github.com/txthinking/brook/issues/988
 	remoteip := ""
+	hdl := &socks5handler{
+		DefaultHandle: &tx.DefaultHandle{}, // not used; see dial, TCPHandle, and UDPHandle
+		px:            core.NewZeroVolatile[ipn.Proxy](),
+	}
 	server, _ := tx.NewClassicServer(host, remoteip, usr, pwd, tcptimeoutsec, udptimeoutsec)
 
 	hasauth := len(usr) > 0 || len(pwd) > 0
 	log.I("svcsocks5: new %s listening at %s; auth?", id, host, hasauth)
-	s := &socks5{
+	return &socks5{
 		Server:    server,
 		id:        id,
 		url:       host,
 		outbound:  dialer,
-		hdl:       &socks5handler{},
+		hdl:       hdl,
 		listener:  listener,
 		summaries: make(map[*tx.UDPExchange]*ServerSummary),
+		status:    core.NewVolatile(SOK),
 		done:      done,
-	}
-	s.status.Store(SOK)
-	return s, nil
+	}, nil
 }
 
 func (h *socks5) Hop(p x.Proxy) error {
@@ -178,12 +179,12 @@ func (h *socks5) ID() string {
 
 func (h *socks5) GetAddr() string {
 	if px := h.hdl.px.Load(); px != nil && core.IsNotNil(px) {
-		return px.GetAddr()
+		return px.GetAddr().V()
 	}
 	return h.url
 }
 
-func (h *socks5) Status() int32 {
+func (h *socks5) Status() int {
 	return h.status.Load()
 }
 
@@ -231,7 +232,7 @@ func (h *socks5) dial(network, src, dst string) (cid string, conn net.Conn, err 
 
 func (h *socks5) pid() (x string) {
 	if px := h.hdl.px.Load(); px != nil && core.IsNotNil(px) {
-		x = px.ID()
+		x = px.ID().V()
 	}
 	return
 }

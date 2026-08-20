@@ -10,7 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net/url"
-	"sync/atomic"
+	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
@@ -29,14 +29,13 @@ type http1 struct {
 	GW          // dual stack gateway
 
 	id       string
-	hdl      uint64
-	dhdl     uint64
 	outbound proxy.Dialer
-	via      atomic.Pointer[core.WeakRef[Proxy]]
+	via      *core.WeakRef[Proxy]
+	viaID    *core.Volatile[string]
 	px       ProxyProvider
 	opts     *settings.ProxyOptions
-	lastdial atomic.Int64
-	status   atomic.Int32
+	lastdial time.Time
+	status   *core.Volatile[int]
 }
 
 func NewHTTPProxy(id string, ctx context.Context, c protect.Controller, px ProxyProvider, po *settings.ProxyOptions) (*http1, error) {
@@ -74,13 +73,12 @@ func NewHTTPProxy(id string, ctx context.Context, c protect.Controller, px Proxy
 	h := &http1{
 		outbound: hp, // does not support udp
 		px:       px,
+		viaID:    core.NewZeroVolatile[string](),
+		status:   core.NewVolatile(TUP),
 		id:       id,
 		opts:     po,
 	}
-	h.status.Store(TUP)
-	h.since.Store(now())
-	h.hdl = core.Loc(h)
-	h.dhdl = core.Loc(h.outbound)
+	h.via, err = core.NewWeakRef(h.viafor, viaok)
 
 	logeif(err != nil)("proxy: http1: created %s with opts(%s); err? %v",
 		h.ID(), po, err)
@@ -88,27 +86,35 @@ func NewHTTPProxy(id string, ctx context.Context, c protect.Controller, px Proxy
 	return h, nil
 }
 
+func (h *http1) viafor() *Proxy {
+	return viafor(h.id, h.viaID.Load(), h.px)
+}
+
+func (h *http1) swapVia(new Proxy) Proxy {
+	return swapVia(h.id, new, h.viaID, h.via)
+}
+
 // Handle implements Proxy.
-func (h *http1) Handle() uint64 {
-	return h.hdl
+func (h *http1) Handle() uintptr {
+	return core.Loc(h)
 }
 
 // DialerHandle implements Proxy.
-func (h *http1) DialerHandle() uint64 {
-	return h.dhdl
+func (h *http1) DialerHandle() uintptr {
+	return core.Loc(h.outbound)
 }
 
 // Dial implements Proxy.
 func (h *http1) Dial(network, addr string) (c protect.Conn, err error) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
 
-	h.lastdial.Store(now())
+	h.lastdial = time.Now()
 
 	who := idstr(h)
-	if ref := h.via.Load(); ref != nil {
-		if v, vok := ref.Get(); vok { // dial via another proxy
+	if usevia(h.viaID) {
+		if v, vok := h.via.Get(); vok { // dial via another proxy
 			who = idstr(v)
 			c, err = v.Dial(network, addr)
 		} else {
@@ -123,11 +129,8 @@ func (h *http1) Dial(network, addr string) (c protect.Conn, err error) {
 		// tx.HttpTunnel.Dial() supports dialing into hostnames
 		c, err = dialers.ProxyDial(h.outbound, network, addr)
 	}
-	defer localDialStatus(&h.status, err)
+	defer localDialStatus(h.status, err)
 
-	if a, ok := laddr(c); ok {
-		h.lastaddr.Store(&a)
-	}
 	log.I("proxy: http1: dial(%s) from %s => %s (via %s); err? %v", network, h.GetAddr(), addr, who, err)
 	return
 }
@@ -143,12 +146,12 @@ func (h *http1) Dialer() protect.RDialer {
 	return h
 }
 
-func (h *http1) ID() string {
-	return h.id
+func (h *http1) ID() *x.Gostr {
+	return x.StrOf(h.id)
 }
 
-func (h *http1) Type() string {
-	return HTTP1
+func (h *http1) Type() *x.Gostr {
+	return x.StrOf(HTTP1)
 }
 
 func (h *http1) Router() x.Router {
@@ -156,63 +159,51 @@ func (h *http1) Router() x.Router {
 }
 
 // Reaches implements x.Router.
-func (h *http1) Reaches(hostportOrIPPortCsv string) bool {
-	return Reaches(h, hostportOrIPPortCsv)
-}
-
-// Self implements x.Router.
-func (h *http1) Self(ip string) bool {
-	if len(ip) <= 0 {
-		return false
-	}
-	// Check cached IPs of the upstream proxy host
-	for _, a := range dialers.CachedAddrs(h.opts.Host) {
-		if a.String() == ip {
-			return true
-		}
-	}
-	// fallback to last known dialed address
-	return h.GW.Self(ip)
+func (h *http1) Reaches(hostportOrIPPortCsv *x.Gostr) bool {
+	return Reaches(h, hostportOrIPPortCsv.V())
 }
 
 // Hop implements Proxy.
-func (h *http1) Hop(via *core.WeakRef[Proxy], dryrun bool) error {
+func (h *http1) Hop(p Proxy, dryrun bool) error {
 	if h.id == GlobalH1 {
 		return errNop // global proxy exits as-is
 	}
 
+	if p == nil {
+		if !dryrun {
+			old := h.swapVia(nil)
+			log.I("proxy: http1: hop(%s) removed", idhandle(old))
+		}
+		return nil
+	}
+	if p.Status() == END {
+		return errProxyStopped
+	}
+
 	if !dryrun {
-		old := h.via.Swap(via)
-		log.I("http1: hop %s => %s", refhandle(old), refhandle(via))
+		old := h.swapVia(p)
+		log.I("http1: hop %s => %s", idhandle(old), idhandle(p))
 	}
 	return nil
 }
 
 // Via implements x.Router.
 func (h *http1) Via() (x.Proxy, error) {
-	if ref := h.via.Load(); ref != nil {
-		if v, ok := ref.Get(); ok && v != nil {
-			return v, nil
-		}
+	if v := h.via.Load(); v != nil {
+		return v, nil
 	}
 	return nil, errNoHop
 }
 
 // GetAddr implements Proxy.
-func (h *http1) GetAddr() string {
-	if a := h.lastaddr.Load(); a != nil {
-		return *a
-	}
-	return h.opts.IPPort
+func (h *http1) GetAddr() *x.Gostr {
+	return x.StrOf(h.opts.IPPort)
 }
 
 // Status implements Proxy.
-func (h *http1) Status() int32 {
+func (h *http1) Status() int {
 	s := h.status.Load()
-	if candial2(s) != nil {
-		return s // paused or ended
-	}
-	if idling(h.lastdial.Load()) {
+	if s != END && idling(h.lastdial) {
 		return TZZ
 	}
 	return s
@@ -226,7 +217,7 @@ func (h *http1) Pause() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TPU)
+	ok := h.status.Cas(st, TPU)
 	log.I("proxy: http1: paused? %t", ok)
 	return ok
 }
@@ -239,7 +230,7 @@ func (h *http1) Resume() bool {
 		return false
 	}
 
-	ok := h.status.CompareAndSwap(st, TUP)
+	ok := h.status.Cas(st, TUP)
 	go h.Refresh() // no-op since SkipRefresh
 	log.I("proxy: http1: resumed? %t", ok)
 	return ok
@@ -254,7 +245,7 @@ func (h *http1) Stop() error {
 
 // OnProtoChange implements Proxy.
 func (h *http1) OnProtoChange(_ LinkProps) (string, bool) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return "", false
 	}
 	return h.opts.FullUrl(), true

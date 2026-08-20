@@ -18,10 +18,10 @@ import (
 // blog.cloudflare.com/when-tcp-sockets-refuse-to-die/
 // shorter count / interval for faster drops
 const (
-	defaultIdle     = 600 // in seconds
-	defaultCount    = 4   // unacknowledged probes
-	defaultInterval = 5   // in seconds
-	// usrTimeoutMillis = 1000*defaultIdle + (defaultInterval * defaultCount)
+	defaultIdle      = 600 // in seconds
+	defaultCount     = 4   // unacknowledged probes
+	defaultInterval  = 5   // in seconds
+	usrTimeoutMillis = 1000*defaultIdle + (defaultInterval * defaultCount)
 )
 
 var (
@@ -52,9 +52,7 @@ func SetTimeoutSockOpt(c MinConn, timeoutms int) bool {
 			sock := int(fd)
 			// code.googlesource.com/google-api-go-client/+/master/transport/grpc/dial_socketopt.go#30
 			if err := unix.SetsockoptInt(sock, unix.SOL_TCP, unix.TCP_USER_TIMEOUT, timeoutms); err != nil {
-				if log.Debug {
-					log.D("core: sockopt: set TCP_USER_TIMEOUT %s (%d) failed: %dms, %v", id, sock, timeoutms, err)
-				}
+				log.D("core: sockopt: set TCP_USER_TIMEOUT %s (%d) failed: %dms, %v", id, sock, timeoutms, err)
 				ok = false
 			}
 		})
@@ -115,34 +113,24 @@ func SetKeepAliveConfigSockOpt(c MinConn, args ...int) (ok bool) {
 		err = rawConn.Control(func(fd uintptr) {
 			sock := int(fd)
 			if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, boolint(true)); err != nil {
-				if log.Debug {
-					log.V("core: sockopt: set SO_KEEPALIVE %s (%d) failed: %v", id, sock, err)
-				}
+				log.V("core: sockopt: set SO_KEEPALIVE %s (%d) failed: %v", id, sock, err)
 				ok = false
 			}
 			if err := syscall.SetsockoptInt(sock, syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, idle); err != nil {
-				if log.Debug {
-					log.V("core: sockopt: set TCP_KEEPIDLE %s (%d) failed: %ds, %v", id, sock, idle, err)
-				}
+				log.V("core: sockopt: set TCP_KEEPIDLE %s (%d) failed: %ds, %v", id, sock, idle, err)
 				ok = false
 			}
 			if err := syscall.SetsockoptInt(sock, syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, interval); err != nil {
-				if log.Debug {
-					log.V("core: sockopt: set TCP_KEEPINTVL %s (%d) failed: %ds, %v", id, sock, interval, err)
-				}
+				log.V("core: sockopt: set TCP_KEEPINTVL %s (%d) failed: %ds, %v", id, sock, interval, err)
 				ok = false
 			}
 			if err := syscall.SetsockoptInt(sock, syscall.IPPROTO_TCP, syscall.TCP_KEEPCNT, count); err != nil {
-				if log.Debug {
-					log.V("core: sockopt: set TCP_KEEPCNT %s (%d) failed: #%d, %v", id, sock, count, err)
-				}
+				log.V("core: sockopt: set TCP_KEEPCNT %s (%d) failed: #%d, %v", id, sock, count, err)
 				ok = false
 			}
 			// code.googlesource.com/google-api-go-client/+/master/transport/grpc/dial_socketopt.go#30
 			if err := unix.SetsockoptInt(sock, unix.SOL_TCP, unix.TCP_USER_TIMEOUT, usertimeoutms); err != nil {
-				if log.Debug {
-					log.V("core: sockopt: set TCP_USER_TIMEOUT %s (%d) failed: %dms, %v", id, sock, usertimeoutms, err)
-				}
+				log.V("core: sockopt: set TCP_USER_TIMEOUT %s (%d) failed: %dms, %v", id, sock, usertimeoutms, err)
 				ok = false
 			}
 		})
@@ -152,59 +140,6 @@ func SetKeepAliveConfigSockOpt(c MinConn, args ...int) (ok bool) {
 		}
 	}
 	return ok
-}
-
-var (
-	MinMtu6 = 1280
-	MinMtu4 = 576
-)
-
-func ChangeBufferSizes(c MinConn, rsz, wsz int) (n int, err error) {
-	// min socket buffer size is at least 4kib
-	if rsz < MinMtu6*4 || wsz < MinMtu6*4 {
-		return -1, errBufferSmall
-	}
-	switch x := c.(type) {
-	case *net.TCPConn:
-		rerr := x.SetReadBuffer(rsz)
-		werr := x.SetWriteBuffer(wsz)
-		return rsz, JoinErr(rerr, werr)
-	case *net.UDPConn:
-		rerr := x.SetReadBuffer(rsz)
-		werr := x.SetWriteBuffer(wsz)
-		return rsz, JoinErr(rerr, werr)
-	}
-	return -2, errNotTcpNotUdp
-}
-
-func ChangeBufferSizesSockOpt(who string, c MinConn, rsz, wsz int) (sock, n int, err error) {
-	// min socket buffer size is at least 4kib
-	if rsz < MinMtu6*4 || wsz < MinMtu6*4 {
-		return -3, -1, errBufferSmall
-	}
-	cs, ok := c.(ControlConn)
-	if !ok {
-		return -3, -2, errNotSyscallConn
-	}
-	s, err := cs.SyscallConn()
-	if err != nil || s == nil {
-		return -3, -3, OneErr(err, errNotSyscallConn)
-	}
-	var oerr1, oerr2 error
-	err = s.Control(func(fd uintptr) {
-		sock = int(fd)
-		if oerr1 = syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_RCVBUF, rsz); oerr1 != nil {
-			if log.Verbose {
-				log.V("core: sockopt: %s set SO_RCVBUF %d failed: %v", who, sock, rsz, oerr1)
-			}
-		}
-		if oerr2 = syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_SNDBUF, wsz); oerr2 != nil {
-			if log.Verbose {
-				log.V("core: sockopt: %s set SO_SNDBUF %d failed: %v", who, sock, wsz, oerr2)
-			}
-		}
-	})
-	return sock, rsz, JoinErr(err, oerr1, oerr2)
 }
 
 func boolint(b bool) int {

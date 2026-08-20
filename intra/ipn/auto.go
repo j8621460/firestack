@@ -9,7 +9,6 @@ package ipn
 import (
 	"context"
 	"net"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -25,7 +24,7 @@ const (
 	delayForUnhealthyProxies = 2 * time.Second
 )
 
-// auto is a proxy that dials multiple, preset outbounds.
+// exit is a proxy that always dials out to the internet.
 type auto struct {
 	NoDNS
 	ProtoAgnostic
@@ -34,36 +33,49 @@ type auto struct {
 	GW
 	pxr  ProxyProvider
 	addr string
-	hdl  uint64
 
-	via atomic.Pointer[core.WeakRef[Proxy]] // via dialer
+	via   *core.WeakRef[Proxy]   // via dialer
+	viaID *core.Volatile[string] // via ID
 
 	exp    *core.Sieve[string, int]
 	ba     *core.Barrier[bool, string]
-	status atomic.Int32
+	status *core.Volatile[int]
 }
 
 // NewAutoProxy returns a new exit proxy.
 func NewAutoProxy(ctx context.Context, pxr Proxies) *auto {
+	var err error
+
 	h := &auto{
-		pxr:  pxr,
-		addr: "127.5.51.52:5321",
-		exp:  core.NewSieve[string, int](ctx, "ipn.a.exp", ttl30s),
-		ba:   core.NewBarrier[bool](ctx, "ipn.a.bar", ttl30s),
+		pxr:    pxr,
+		viaID:  core.NewZeroVolatile[string](),
+		addr:   "127.5.51.52:5321",
+		exp:    core.NewSieve[string, int](ctx, ttl30s),
+		ba:     core.NewBarrier[bool](ttl30s),
+		status: core.NewVolatile(TUP),
 	}
-	h.status.Store(TUP)
-	h.since.Store(now())
-	h.hdl = core.Loc(h)
+	h.via, err = core.NewWeakRef(h.viafor, viaok)
+	if err != nil {
+		panic(err) // unlikely
+	}
 	return h
 }
 
+func (h *auto) viafor() *Proxy {
+	return viafor(idstr(h), h.viaID.Load(), h.pxr)
+}
+
+func (h *auto) swapVia(new Proxy) Proxy {
+	return swapVia(idstr(h), new, h.viaID, h.via)
+}
+
 // Handle implements Proxy.
-func (h *auto) Handle() uint64 {
-	return h.hdl
+func (h *auto) Handle() uintptr {
+	return core.Loc(h)
 }
 
 // DialerHandle implements Proxy.
-func (h *auto) DialerHandle() (mix uint64) {
+func (h *auto) DialerHandle() (mix uintptr) {
 	remoteOnly := settings.AutoAlwaysRemote()
 	if !remoteOnly {
 		if exit, _ := h.pxr.ProxyFor(Exit); exit != nil {
@@ -75,6 +87,9 @@ func (h *auto) DialerHandle() (mix uint64) {
 	}
 	if win, _ := h.pxr.mainRpnProxyOf(RpnWin); win != nil {
 		mix ^= win.DialerHandle()
+	}
+	if sep, _ := h.pxr.mainRpnProxyOf(RpnSE); sep != nil {
+		mix ^= sep.DialerHandle()
 	}
 
 	return mix
@@ -91,18 +106,19 @@ func (h *auto) DialBind(network, local, remote string) (protect.Conn, error) {
 }
 
 func (h *auto) dial(network, laddr, raddr string) (protect.Conn, error) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
 
 	exit, exerr := h.pxr.ProxyFor(Exit)
 	exit64, ex64err := h.pxr.ProxyFor(Rpn64)
 	win, winerr := h.pxr.mainRpnProxyOf(RpnWin)
+	sep, seerr := h.pxr.mainRpnProxyOf(RpnSE)
 
-	pxrerrs := core.JoinErr(exerr, winerr, ex64err)
+	pxrerrs := core.JoinErr(exerr, winerr, seerr, ex64err)
 
-	if ref := h.via.Load(); ref != nil {
-		if v, vok := ref.Get(); !vok {
+	if usevia(h.viaID) {
+		if v, vok := h.via.Get(); !vok {
 			if removeViaOnErrors {
 				h.Hop(nil, false /*dryrun*/) // stale; unset
 			}
@@ -126,7 +142,7 @@ func (h *auto) dial(network, laddr, raddr string) (protect.Conn, error) {
 	totdials := -1
 
 	if !parallelDial {
-		rpns := []Proxy{exit, exit64, win}
+		rpns := []Proxy{exit, exit64, sep, win}
 		healthy := core.Map(
 			core.FilterLeft(
 				rpns,
@@ -221,6 +237,25 @@ func (h *auto) dial(network, laddr, raddr string) (protect.Conn, error) {
 				}
 				return h.dialIfHealthy(exit64, network, laddr, raddr)
 			}, func(ctx context.Context) (protect.Conn, error) {
+				const myidx = 2
+				if sep == nil {
+					return nil, seerr
+				}
+				if recent {
+					if previdx != myidx {
+						return nil, errNotPinned
+					}
+					// ip pinned to this proxy
+					return h.dialAlways(sep, network, laddr, raddr)
+				}
+
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(shortdelay * myidx): // 400ms
+				}
+				return h.dialIfHealthy(sep, network, laddr, raddr)
+			}, func(ctx context.Context) (protect.Conn, error) {
 				const myidx = 3
 				if win == nil {
 					return nil, winerr
@@ -254,30 +289,27 @@ func (h *auto) dial(network, laddr, raddr string) (protect.Conn, error) {
 		}
 	}
 
-	defer localDialStatus(&h.status, err)
+	defer localDialStatus(h.status, err)
 
 	kaenabled := maybeKeepAlive(c)
-	n, berr := changeBufferSizes(c)
-	logei(err)("proxy: auto: w(%d) pin(%t+%t/%d), dial(%s) %s, ka? %t / parallel? %t / remote? %t; tot(healthy %d / dials %d); errs? %v+%v; sz? %d (%v)",
-		who, recent, !delpin, previdx, network, raddr, kaenabled, parallelDial, remoteOnly, tothealthy, totdials, err, pxrerrs, n, berr)
+	logei(err)("proxy: auto: w(%d) pin(%t+%t/%d), dial(%s) %s, ka? %t / parallel? %t / remote? %t; tot(healthy %d / dials %d); errs? %v+%v",
+		who, recent, !delpin, previdx, network, raddr, kaenabled, parallelDial, remoteOnly, tothealthy, totdials, err, pxrerrs)
 
 	return c, err
 }
 
 // Announce implements Proxy.
 func (h *auto) Announce(network, local string) (protect.PacketConn, error) {
-	if err := candial(&h.status); err != nil {
+	if err := candial(h.status); err != nil {
 		return nil, err
 	}
-
-	// TODO: settings.AutoDialsParallel
-	remoteOnly := settings.AutoAlwaysRemote()
 
 	exit, exerr := h.pxr.ProxyFor(Exit)
 	win, winerr := h.pxr.mainRpnProxyOf(RpnWin)
 
 	previdx, recent := h.exp.Get(local)
 
+	// TODO: announceIfHealthy
 	c, who, err := core.Race(
 		network+".announce-auto."+local,
 		tlsHandshakeTimeout,
@@ -285,9 +317,6 @@ func (h *auto) Announce(network, local string) (protect.PacketConn, error) {
 			const myidx = 0
 			if exit == nil {
 				return nil, exerr
-			}
-			if remoteOnly {
-				return nil, errNotRemote
 			}
 			if recent {
 				if previdx != myidx {
@@ -309,132 +338,56 @@ func (h *auto) Announce(network, local string) (protect.PacketConn, error) {
 				// ip pinned to this proxy
 				return h.announceIfHealthy(win, network, local)
 			}
-			// delay if not dialing remote exclusively
-			if !remoteOnly {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(shortdelay * myidx): // 100ms
-				}
-			}
-			return h.announceIfHealthy(win, network, local)
-		},
-	)
-	defer localDialStatus(&h.status, err)
-
-	n, berr := changeBufferSizes(c)
-	log.I("proxy: auto: w(%d) listen(%s) to %s; err? %v; sz? %d (%v)", who, network, local, err, n, berr)
-	return c, err
-}
-
-// Accept implements Proxy.
-func (h *auto) Accept(network, local string) (protect.Listener, error) {
-	if err := candial(&h.status); err != nil {
-		return nil, err
-	}
-
-	// TODO: settings.AutoDialsParallel
-	remoteOnly := settings.AutoAlwaysRemote()
-
-	exit, exerr := h.pxr.ProxyFor(Exit)
-	win, winerr := h.pxr.mainRpnProxyOf(RpnWin)
-
-	previdx, recent := h.exp.Get(local)
-
-	l, who, err := core.Race(
-		network+".accept-auto."+local,
-		tlsHandshakeTimeout,
-		func(ctx context.Context) (protect.Listener, error) {
-			const myidx = 0
-			if exit == nil {
-				return nil, exerr
-			}
-			if remoteOnly {
-				return nil, errNotRemote
-			}
-			if recent {
-				if previdx != myidx {
-					return nil, errNotPinned
-				}
-				return h.acceptIfHealthy(exit, network, local)
-			}
-			return h.acceptIfHealthy(exit, network, local)
-		}, func(ctx context.Context) (protect.Listener, error) {
-			const myidx = 1
-			if win == nil {
-				return nil, winerr
-			}
-			if recent {
-				if previdx != myidx {
-					return nil, errNotPinned
-				}
-				return h.acceptIfHealthy(win, network, local)
-			}
-			// delay if not dialing remote exclusively
-			if !remoteOnly {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(shortdelay * myidx): // 100ms
-				}
-			}
-			return h.acceptIfHealthy(win, network, local)
-		},
-	)
-	defer localDialStatus(&h.status, err)
-
-	log.I("proxy: auto: w(%d) accept(%s) on %s; err? %v", who, network, local, err)
-	return l, err
-}
-
-// Probe implements Proxy.
-func (h *auto) Probe(network, local string) (protect.PacketConn, error) {
-	if err := candial(&h.status); err != nil {
-		return nil, err
-	}
-
-	exit, exerr := h.pxr.ProxyFor(Exit)
-	win, winerr := h.pxr.mainRpnProxyOf(RpnWin)
-
-	previdx, recent := h.exp.Get(local)
-
-	pc, who, err := core.Race(
-		network+".probe-auto."+local,
-		tlsHandshakeTimeout,
-		func(ctx context.Context) (protect.PacketConn, error) {
-			const myidx = 0
-			if exit == nil {
-				return nil, exerr
-			}
-			if recent {
-				if previdx != myidx {
-					return nil, errNotPinned
-				}
-				return h.probeIfHealthy(exit, network, local)
-			}
-			return h.probeIfHealthy(exit, network, local)
-		}, func(ctx context.Context) (protect.PacketConn, error) {
-			const myidx = 1
-			if win == nil {
-				return nil, winerr
-			}
-			if recent {
-				if previdx != myidx {
-					return nil, errNotPinned
-				}
-				return h.probeIfHealthy(win, network, local)
-			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(shortdelay * myidx): // 100ms
 			}
-			return h.probeIfHealthy(win, network, local)
-		},
+			return h.announceIfHealthy(win, network, local)
+		}, // seasy-proxy does not support udp?
 	)
-	defer localDialStatus(&h.status, err)
+	defer localDialStatus(h.status, err)
 
-	log.I("proxy: auto: w(%d) probe(%s) on %s; err? %v", who, network, local, err)
+	log.I("proxy: auto: w(%d) listen(%s) to %s; err? %v", who, network, local, err)
+	return c, err
+}
+
+// Accept implements Proxy.
+func (h *auto) Accept(network, local string) (l protect.Listener, err error) {
+	if err := candial(h.status); err != nil {
+		return nil, err
+	}
+	if settings.AutoAlwaysRemote() {
+		log.E("proxy: auto: accept(%s) on %s remote-dial unimplemented", network, local)
+		return nil, errNotRemote
+	}
+	exit, err := h.pxr.ProxyFor(Exit)
+	if err == nil {
+		l, err = exit.Dialer().Accept(network, local)
+	}
+	defer localDialStatus(h.status, err)
+
+	log.I("proxy: auto: accept(%s) on %s; err? %v", network, local, err)
+	return l, err
+}
+
+// Probe implements Proxy.
+func (h *auto) Probe(network, local string) (pc protect.PacketConn, err error) {
+	if err := candial(h.status); err != nil {
+		return nil, err
+	}
+	if settings.AutoAlwaysRemote() {
+		log.E("proxy: auto: probe(%s) on %s remote-dial unimplemented", network, local)
+		return nil, errNotRemote
+	}
+	// todo: rpnwg, rpnamz, rpnwin
+	exit, err := h.pxr.ProxyFor(Exit)
+	if err == nil {
+		pc, err = exit.Dialer().Probe(network, local)
+	}
+	defer localDialStatus(h.status, err)
+
+	log.I("proxy: auto: probe(%s) on %s; err? %v", network, local, err)
 	return pc, err
 }
 
@@ -444,13 +397,13 @@ func (h *auto) Dialer() protect.RDialer {
 }
 
 // ID implements x.Proxy.
-func (h *auto) ID() string {
-	return Auto
+func (h *auto) ID() *x.Gostr {
+	return x.StrOf(Auto)
 }
 
 // Type implements x.Proxy.
-func (h *auto) Type() string {
-	return RPN
+func (h *auto) Type() *x.Gostr {
+	return x.StrOf(RPN)
 }
 
 // Router implements x.Proxy.
@@ -459,66 +412,55 @@ func (h *auto) Router() x.Router {
 }
 
 // Reaches implements x.Router.
-func (h *auto) Reaches(hostportOrIPPortCsv string) bool {
-	return Reaches(h, hostportOrIPPortCsv)
-}
-
-// Self implements x.Router.
-func (h *auto) Self(ip string) bool {
-	if len(ip) <= 0 {
-		return false
-	}
-	if settings.AutoAlwaysRemote() {
-		if win, _ := h.pxr.mainRpnProxyOf(RpnWin); win != nil {
-			if iscircular(win, ip) {
-				return true
-			}
-		}
-		if exit64, _ := h.pxr.ProxyFor(Rpn64); exit64 != nil {
-			if iscircular(exit64, ip) {
-				return true
-			}
-		}
-		return false
-	}
-	if exit, _ := h.pxr.ProxyFor(Exit); exit != nil {
-		return iscircular(exit, ip)
-	}
-	return false
+func (h *auto) Reaches(hostportOrIPPortCsv *x.Gostr) bool {
+	return Reaches(h, hostportOrIPPortCsv.V())
 }
 
 // Hop implements Proxy.
-func (h *auto) Hop(via *core.WeakRef[Proxy], dryrun bool) error {
-	var winerr error
-	if !dryrun {
-		old := h.via.Swap(via)
-		log.I("proxy: auto: hop %s => %s", refhandle(old), refhandle(via))
+func (h *auto) Hop(p Proxy, dryrun bool) error {
+	if p == nil {
+		if !dryrun {
+			old := h.swapVia(nil)
+			log.I("proxy: auto: hop(%s) removed", idhandle(old))
+		}
+		return nil
 	}
-	if win, _ := h.pxr.mainRpnProxyOf(RpnWin); win != nil {
-		winerr = win.Hop(via, dryrun)
+	if p.Status() == END {
+		return errProxyStopped
 	}
 
-	logei(winerr)("proxy: auto: hop set; win err? %v", winerr)
+	var sep, win Proxy
+	var waerr, seerr, winerr error
+	old := h.swapVia(p)
+	if win, winerr = h.pxr.mainRpnProxyOf(RpnWin); win != nil {
+		winerr = win.Hop(p, dryrun)
+	}
+	if sep, seerr = h.pxr.mainRpnProxyOf(RpnSE); sep != nil {
+		seerr = sep.Hop(p, dryrun)
+	}
 
-	return winerr
+	errs := core.JoinErr(waerr, seerr, winerr) // may be nil
+
+	logei(errs)("proxy: auto: hop(%s) => %s; errs? %v",
+		idhandle(old), idhandle(p), errs)
+
+	return errs
 }
 
 func (h *auto) Via() (x.Proxy, error) {
-	if ref := h.via.Load(); ref != nil {
-		if v, ok := ref.Get(); ok && v != nil {
-			return v, nil
-		}
+	if v := h.via.Load(); v != nil {
+		return v, nil
 	}
 	return nil, errNoHop
 }
 
 // GetAddr implements x.Proxy.
-func (h *auto) GetAddr() string {
-	return h.addr
+func (h *auto) GetAddr() *x.Gostr {
+	return x.StrOf(h.addr)
 }
 
 // Status implements x.Proxy.
-func (h *auto) Status() int32 {
+func (h *auto) Status() int {
 	return h.status.Load()
 }
 
@@ -577,40 +519,6 @@ func (*auto) announceIfHealthy(p Proxy, network, local string) (net.PacketConn, 
 		time.Sleep(delayForUnhealthyProxies)
 	}
 	return p.Dialer().Announce(network, local)
-}
-
-func (*auto) acceptIfHealthy(p Proxy, network, local string) (net.Listener, error) {
-	if err := healthy(p); err != nil {
-		log.E("auto accept; %s %s not ok; %v: %s", p.ID(), network, err, local)
-		time.Sleep(delayForUnhealthyProxies)
-	}
-	return p.Dialer().Accept(network, local)
-}
-
-func (*auto) probeIfHealthy(p Proxy, network, local string) (net.PacketConn, error) {
-	if err := healthy(p); err != nil {
-		log.E("auto probe; %s %s not ok; %v: %s", p.ID(), network, err, local)
-		time.Sleep(delayForUnhealthyProxies)
-	}
-	return p.Dialer().Probe(network, local)
-}
-
-func changeBufferSizes(c core.MinConn) (int, error) {
-	opts := settings.GetDialerOpts()
-	rsz := int(opts.ReadBufferSize)
-	wsz := int(opts.WriteBufferSize)
-	return core.ChangeBufferSizes(c, rsz, wsz)
-}
-
-// laddr returns the local address of conn c as a string, or false if c is nil.
-func laddr(c net.Conn) (string, bool) {
-	if c == nil || core.IsNil(c) {
-		return "", false
-	}
-	if addr := c.LocalAddr(); addr != nil {
-		return addr.String(), true
-	}
-	return "", false
 }
 
 func maybeKeepAlive(c net.Conn) (keepingalive bool) {

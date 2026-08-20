@@ -12,9 +12,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
-	"strings"
-	"sync/atomic"
 	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
@@ -26,6 +25,7 @@ import (
 	"github.com/celzero/firestack/intra/settings"
 	"github.com/celzero/firestack/intra/xdns"
 	"github.com/miekg/dns"
+	_ "go4.org/unsafe/assume-no-moving-gc"
 )
 
 const usepool = true
@@ -38,24 +38,24 @@ type dot struct {
 
 	id string // id of the transport
 
+	url      string // full url
 	addrport string // ip:port or hostname:port
 	port     uint16 // port number
 	host     string // hostname from the url
 
 	c             *dns.Client
-	proxies       ipn.ProxyProvider        // may be nil
-	relay         string                   // may be empty
-	relayref      *core.WeakRef[ipn.Proxy] // preset ref to relay proxy, if any
+	proxies       ipn.ProxyProvider // may be nil
+	relay         string            // may be empty
 	skipTLSVerify bool
 
-	pool    *core.MultConnPool[uint64]
+	pool    *core.MultConnPool[uintptr]
 	usepool bool
 
-	echconfig      atomic.Pointer[tls.Config] // echconfig for the endpoint; may be nil
-	echlastattempt atomic.Int64               // last attempt fetching ech cfg; unix milli
+	echconfig      *core.Volatile[*tls.Config] // echconfig for the endpoint; may be nil
+	echlastattempt *core.Volatile[time.Time]   // last attempt fetching ech cfg
 
 	est    core.P2QuantileEstimator
-	status atomic.Int32
+	status *core.Volatile[int]
 }
 
 var _ dnsx.Transport = (*dot)(nil)
@@ -67,58 +67,57 @@ func NewTLSTransport(ctx context.Context, id, rawurl string, addrs []string, px 
 		SessionTicketsDisabled: false,
 	}
 
-	// rawurl is either tls:host[:port] or tls://host[:port] or host[:port] or host
-	skipTLSVerify := !hasTLSScheme(rawurl)
-	if skipTLSVerify {
+	// rawurl is either tls:host[:port] or tls://host[:port] or host[:port]
+	parsedurl, err := url.Parse(rawurl)
+	if err != nil {
+		return
+	}
+	skipTLSVerify := false
+	if parsedurl.Scheme != "tls" {
 		log.I("dot: disabling tls verification for %s", rawurl)
 		tlscfg.InsecureSkipVerify = true
+		skipTLSVerify = true
 	}
 	var relay string
-	var relayref *core.WeakRef[ipn.Proxy]
 	if px != nil {
 		if p, _ := px.ProxyFor(id); p != nil {
-			relay = p.ID()
-			if ref, err := px.ProxyRef("relay.dot."+id, relay); err == nil {
-				relayref = ref
-			}
+			relay = p.ID().V()
 		}
 	}
-	// addrport always includes a port (defaulting to 853); hostname is the
-	// server name used for SNI, ECH, and address registration.
-	addrport, port := url2addrport(rawurl)
-	hostname, _, err := net.SplitHostPort(addrport)
-	if err != nil { // unlikely; url2addrport always returns a host:port
-		return nil, err
-	}
 	ctx, done := context.WithCancel(ctx)
+	hostname := parsedurl.Hostname()
+	if len(hostname) <= 0 {
+		hostname = rawurl
+	}
 	// addrs are pre-determined ip addresses for url / hostname
 	ok := dnsx.RegisterAddrs(id, hostname, addrs)
 	// add sni to tls config
 	tlscfg.ServerName = hostname
 	tlscfg.ClientSessionCache = core.TlsSessionCache()
+	addrport, port := url2addrport(rawurl)
 	t = &dot{
-		ctx:           ctx,
-		done:          done,
-		id:            id,
-		host:          hostname,
-		skipTLSVerify: skipTLSVerify,
-		addrport:      addrport, // may or may not be ipaddr
-		port:          port,
-		proxies:       px,
-		relay:         relay,
-		relayref:      relayref,
-		pool:          core.NewMultConnPool[uint64](ctx),
-		usepool:       usepool,
-		est:           core.NewP50Estimator(ctx),
-		// echconfig/echlastattempt: zero values (nil) are fine
+		ctx:            ctx,
+		done:           done,
+		id:             id,
+		url:            rawurl,
+		host:           hostname,
+		skipTLSVerify:  skipTLSVerify,
+		addrport:       addrport, // may or may not be ipaddr
+		port:           port,
+		status:         core.NewVolatile(x.Start),
+		proxies:        px,
+		relay:          relay,
+		pool:           core.NewMultConnPool[uintptr](ctx),
+		usepool:        usepool,
+		est:            core.NewP50Estimator(ctx),
+		echconfig:      core.NewZeroVolatile[*tls.Config](),
+		echlastattempt: core.NewZeroVolatile[time.Time](),
 	}
-	t.status.Store(dnsx.Start)
-
-	core.Go("dot.ech."+id, func() { t.getOrCreateEchConfigIfNeeded() })
+	echcfg := t.getOrCreateEchConfigIfNeeded()
 	// local dialer: protect.MakeNsDialer(id, ctl)
 	t.c = dnsclient(tlscfg)
 	log.I("dot: (%s) setup: %s; relay? %t; resolved? %t, ech? %t",
-		id, rawurl, len(relay) > 0, ok, t.echconfig.Load() != nil)
+		id, rawurl, len(relay) > 0, ok, echcfg != nil)
 	return t, nil
 }
 
@@ -145,7 +144,7 @@ func (t *dot) ech() []byte {
 func (t *dot) echVerifyFn() func(tls.ConnectionState) error {
 	if t.skipTLSVerify {
 		return func(info tls.ConnectionState) error {
-			log.V("dot: skip ech verify for %s via %s", t.addrport, info.ServerName)
+			log.V("doh: skip ech verify for %s via %s", t.addrport, info.ServerName)
 			return nil // never reject
 		}
 	}
@@ -170,19 +169,14 @@ func (t *dot) doQuery(pid string, q *dns.Msg) (response *dns.Msg, rpid string, e
 	return
 }
 
-func (t *dot) tlsdial(p ipn.Proxy) (dc *dns.Conn, who uint64, usingech bool, err error) {
+func (t *dot) tlsdial(p ipn.Proxy) (dc *dns.Conn, who uintptr, usingech bool, err error) {
 	who = p.Handle()
 
 	defer func() {
 		if dc != nil {
-			if c := dc.Conn; core.IsNotNil(c) {
-				if tc, ok := c.(*tls.Conn); ok {
-					if tc.NetConn() == nil || core.IsNil(tc.NetConn()) {
-						return
-					}
-				}
-				// todo: higher timeout for if using proxy dialer
-				// _ = c.SetDeadline(time.Now().Add(dottimeout * 2))
+			// todo: higher timeout for if using proxy dialer
+			// _ = c.SetDeadline(time.Now().Add(dottimeout * 2))
+			if c := dc.Conn; c != nil {
 				_ = c.SetDeadline(time.Now().Add(dottimeout))
 			}
 		}
@@ -192,35 +186,35 @@ func (t *dot) tlsdial(p ipn.Proxy) (dc *dns.Conn, who uint64, usingech bool, err
 		return dc, who, false, nil // pooled connections don't track ECH state
 	}
 
-	var c net.Conn     // dot is always tcp
-	addr := t.addrport // t.addr may be ip or hostname
+	var c net.Conn = nil // dot is always tcp
+	addr := t.addrport   // t.addr may be ip or hostname
 
 	// Try ECH first if available
 	if echcfg := t.getOrCreateEchConfigIfNeeded(); echcfg != nil {
 		// update ech config which may have been changed by DialWithTls
 		defer t.echconfig.Store(echcfg)
 		c, err = dialers.DialWithTls(p.Dialer(), echcfg, "tcp", addr)
-		usingech = err == nil && core.IsNotNil(c)
 	}
 
-	if core.IsNil(c) { // no ech or ech failed
+	if c == nil && core.IsNil(c) { // no ech or ech failed
 		cfg := t.c.TLSConfig
 		c, err = dialers.DialWithTls(p.Dialer(), cfg, "tcp", addr)
 		usingech = false
 	}
-	if core.IsNotNil(c) {
+	if c != nil && core.IsNotNil(c) {
 		if tlsConn, ok := c.(*tls.Conn); ok && usingech {
 			usingech = tlsConn.ConnectionState().ECHAccepted
 		}
 		return &dns.Conn{Conn: c}, who, usingech, err
+	} else {
+		err = core.OneErr(err, errNoNet)
+		log.W("dot: tlsdial: (%s) nil conn/err for %s, ech? %t; err? %v",
+			t.id, addr, usingech, err)
 	}
-	err = core.OneErr(err, errNoNet)
-	log.W("dot: tlsdial: (%s) nil conn/err for %s, ech? %t; err? %v",
-		t.id, addr, usingech, err)
 	return nil, who, false, err
 }
 
-func (t *dot) pxdial(pid string) (*dns.Conn, string, uint64, bool, error) {
+func (t *dot) pxdial(pid string) (*dns.Conn, string, uintptr, bool, error) {
 	var px ipn.Proxy
 	if len(t.relay) > 0 { // relay takes precedence
 		pid = t.relay
@@ -234,7 +228,7 @@ func (t *dot) pxdial(pid string) (*dns.Conn, string, uint64, bool, error) {
 	if px == nil {
 		return nil, "", core.Nobody, false, dnsx.ErrNoProxyProvider
 	}
-	pid = px.ID()
+	pid = px.ID().V()
 	rpid := ipn.ViaID(px)
 	if settings.Debug {
 		log.V("dot: pxdial: (%s) using relay/proxy %s (via: %s) at %s",
@@ -246,7 +240,7 @@ func (t *dot) pxdial(pid string) (*dns.Conn, string, uint64, bool, error) {
 }
 
 // toPool takes ownership of c.
-func (t *dot) toPool(id uint64, c *dns.Conn) {
+func (t *dot) toPool(id uintptr, c *dns.Conn) {
 	if !t.usepool || id == core.Nobody {
 		clos(c)
 		return
@@ -256,7 +250,7 @@ func (t *dot) toPool(id uint64, c *dns.Conn) {
 }
 
 // fromPool returns a conn from the pool, if available.
-func (t *dot) fromPool(id uint64) (c *dns.Conn) {
+func (t *dot) fromPool(id uintptr) (c *dns.Conn) {
 	if !t.usepool || id == core.Nobody {
 		return
 	}
@@ -288,7 +282,7 @@ func (t *dot) sendRequest(pid string, q *dns.Msg) (ans *dns.Msg, rpid string, ec
 	}
 
 	var conn *dns.Conn
-	who := core.Nobody
+	var who uintptr
 	userelay := len(t.relay) > 0
 	useproxy := len(pid) != 0 // pid == dnsx.NetNoProxy => ipn.Block
 	if useproxy || userelay { // ref dns.Client.Dial
@@ -319,9 +313,8 @@ func (t *dot) sendRequest(pid string, q *dns.Msg) (ans *dns.Msg, rpid string, ec
 	return
 }
 
-func (t *dot) chooseProxy(fid string, pids ...string) string {
-	// TODO: DoT could use DTLS which is udp?
-	return dnsx.ChooseHealthyProxyHostPort(fid+" dot."+t.id, dnsx.NetTypeTCP, t.addrport, t.port, pids, t.proxies)
+func (t *dot) chooseProxy(pids ...string) string {
+	return dnsx.ChooseHealthyProxyHostPort("dot: "+t.id, t.addrport, t.port, pids, t.proxies)
 }
 
 func (t *dot) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *dns.Msg, err error) {
@@ -331,10 +324,10 @@ func (t *dot) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *dns.Msg
 	var ech bool
 
 	if r := t.relay; len(r) > 0 {
-		pid = t.chooseProxy(smm.FID, r)
+		pid = t.chooseProxy(r)
 	} else {
 		_, pids := xdns.Net2ProxyID(network)
-		pid = t.chooseProxy(smm.FID, pids...)
+		pid = t.chooseProxy(pids...)
 	}
 
 	ans, rpid, ech, elapsed, qerr = t.doQuery(pid, q)
@@ -351,8 +344,10 @@ func (t *dot) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *dns.Msg
 	smm.RData = xdns.GetInterestingRData(ans)
 	smm.RCode = xdns.Rcode(ans)
 	smm.RTtl = xdns.RTtl(ans)
-	smm.Server = t.GetAddr()
-	smm.ECH = ech
+	smm.Server = t.getAddr()
+	if ech {
+		smm.Server = dnsx.EchPrefix + smm.Server
+	}
 	smm.PID = pid   // may be local dnsx.IsLocalProxy
 	smm.RPID = rpid // may be empty
 	if err != nil {
@@ -362,47 +357,46 @@ func (t *dot) Query(network string, q *dns.Msg, smm *x.DNSSummary) (ans *dns.Msg
 	t.est.Add(smm.Latency)
 
 	if settings.Debug {
-		log.V("dot: %s (fid: %s) ech? %t; len(res): fro %s:%d a:%d/sz:%d/pad:%d, data: %s / status: %d, via: %s, err? %v",
-			t.id, smm.FID, ech, smm.QName, smm.QType, xdns.Len(ans), xdns.Size(ans), xdns.EDNS0PadLen(ans), smm.RData, smm.Status, smm.PID, err)
+		log.V("dot: %s ech? %t; len(res): fro %s:%d a:%d/sz:%d/pad:%d, data: %s / status: %d, via: %s, err? %v",
+			t.id, ech, smm.QName, smm.QType, xdns.Len(ans), xdns.Size(ans), xdns.EDNS0PadLen(ans), smm.RData, smm.Status, smm.PID, err)
 	}
 
 	return
 }
 
-func (t *dot) ID() string {
-	return t.id
+func (t *dot) ID() *x.Gostr {
+	return x.StrOf(t.id)
 }
 
-func (t *dot) Type() string {
-	return dnsx.DOT
+func (t *dot) Type() *x.Gostr {
+	return x.StrOf(dnsx.DOT)
 }
 
 func (t *dot) P50() int64 {
 	return t.est.Get()
 }
 
+func (t *dot) GetAddr() *x.Gostr {
+	return x.StrOf(t.getAddr())
+}
+
 func (t *dot) GetRelay() x.Proxy {
-	if t.relayref == nil {
-		return nil
-	}
-	if p, valid := t.relayref.Get(); valid {
-		return p
+	if r := t.relay; len(r) > 0 {
+		px, _ := t.proxies.ProxyFor(r)
+		return px
 	}
 	return nil
 }
 
-func (t *dot) Relaying() bool {
-	return len(t.relay) > 0
-}
-
-func (t *dot) GetAddr() string {
-	prefix0 := dnsx.CryptoPrefix(t.skipTLSVerify, t.echconfig.Load() != nil)
-	prefix1 := dnsx.TransportPrefix(t.id)
-	return prefix0 + prefix1 + t.addrport
-}
-
-func (t *dot) Measure(mid string, n, seconds int32) *x.DNSMeasurement {
-	return dnsx.Perf(t, mid, n, seconds)
+func (t *dot) getAddr() (addr string) {
+	if t.echconfig.Load() != nil {
+		addr = dnsx.EchPrefix + t.addrport
+	} else if t.skipTLSVerify {
+		addr = dnsx.NoPkiPrefix + t.addrport
+	} else {
+		addr = t.addrport
+	}
+	return addr
 }
 
 func (t *dot) IPPorts() (ipps []netip.AddrPort) {
@@ -412,20 +406,13 @@ func (t *dot) IPPorts() (ipps []netip.AddrPort) {
 	return
 }
 
-func (t *dot) Status() int32 {
+func (t *dot) Status() int {
 	if px := t.GetRelay(); px != nil {
-		if y, to := dnsx.OverrideStatusFrom(px); y {
-			return to
+		if px.Status() == ipn.TPU { // relay paused => transport paused
+			return dnsx.Paused
 		}
 	}
-	s := t.status.Load()
-	if s == dnsx.Paused {
-		// paused status is a pseudo state dependent on underlying relay
-		// or requested pid, not a permanent state of this transport.
-		t.status.CompareAndSwap(s, dnsx.Unpaused)
-		return dnsx.Unpaused
-	}
-	return s
+	return t.status.Load()
 }
 
 func (t *dot) Stop() error {
@@ -434,32 +421,25 @@ func (t *dot) Stop() error {
 	return nil
 }
 
-// hasTLSScheme reports whether url begins with the explicit "tls" scheme.
-// Matches both "tls://host[:port]" and "tls:host[:port]".
-func hasTLSScheme(url string) bool {
-	return strings.HasPrefix(url, "tls:")
-}
-
-// url2addrport returns the host:port (for dialing) and the numeric port for a
-// DoT url of the form tls://host[:port], tls:host[:port], host[:port], or host.
-// A missing or malformed port defaults to 853.
-func url2addrport(url string) (addrport string, port uint16) {
-	// strip any explicit tls scheme
+func url2addrport(url string) (string, uint16) {
+	// url is of type "tls://host:port" or "tls:host:port" or "host:port" or "host"
 	if len(url) > 6 && url[:6] == "tls://" {
 		url = url[6:]
-	} else if hasTLSScheme(url) {
+	}
+	if len(url) > 4 && url[:4] == "tls:" {
 		url = url[4:]
 	}
-	host := url
-	port = DotPortU16
-	// extract port if present
-	if h, p, err := net.SplitHostPort(url); err == nil {
-		host = h
-		if v, aerr := strconv.Atoi(p); aerr == nil && v > 0 {
+	port := DotPortU16
+	// add port 853 if not present
+	if _, p, err := net.SplitHostPort(url); err != nil {
+		url = net.JoinHostPort(url, DotPort)
+	} else {
+		v, err := strconv.Atoi(p)
+		if err != nil && v > 0 {
 			port = uint16(v)
 		}
 	}
-	return net.JoinHostPort(host, strconv.Itoa(int(port))), port
+	return url, port
 }
 
 func (t *dot) getOrCreateEchConfigIfNeeded() *tls.Config {
@@ -469,12 +449,11 @@ func (t *dot) getOrCreateEchConfigIfNeeded() *tls.Config {
 	}
 
 	prev := t.echlastattempt.Load()
-	now := time.Now().UnixMilli()
-
-	if prev > 0 && now-prev < echRetryPeriod.Milliseconds() {
+	if time.Since(prev) < echRetryPeriod {
 		return nil
 	}
-	if !t.echlastattempt.CompareAndSwap(prev, now) {
+	refetch := t.echlastattempt.Cas(prev, time.Now())
+	if !refetch {
 		return nil
 	}
 

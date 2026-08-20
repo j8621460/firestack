@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/netip"
 	"slices"
 	"strings"
@@ -59,12 +58,9 @@ const (
 	IpMapper  = x.IpMapper
 	NoDNS     = ""
 
-	// DNS request origin indicator:
-	// OriginInternal flags requests by firestack or its owner uid.
+	// DNS request origin indicators
 	OriginInternal = x.OriginInternal
-	// OriginTunnel flags requests by tunnel read (presumably from another app,
-	// or firestack or its owner uid if Loopback mode is turned on).
-	OriginTunnel = x.OriginTunnel
+	OriginTunnel   = x.OriginTunnel
 
 	invalidQname = "invalid.query"
 
@@ -81,15 +77,14 @@ const (
 	ttl10m = 10 * time.Minute
 
 	listenerTimeout = 3 * time.Second
-	answerTimeout   = 15 * time.Second
 
 	// pseudo transport ID to tag dns64 responses
 	AlgDNS64 = "dns64"
 )
 
 var (
-	selfprefix    = protect.Selfhost + "."
-	systemprefix  = protect.Systemhost + "."
+	selfprefix    = protect.UidSelf + "."
+	systemprefix  = protect.UidSystem + "."
 	algprefix     = "alg."
 	cacheprefix   = "cached."
 	plusprefix    = "plus."
@@ -97,29 +92,29 @@ var (
 	defaultprefix = "d."
 	presetprefix  = "pre."
 	fixedprefix   = "fix."
-	echPrefix     = "ech."
-	noPkiPrefix   = "nopki."
+	EchPrefix     = "ech."
+	NoPkiPrefix   = "nopki."
 
 	NoIPPort []netip.AddrPort = nil
 )
 
 var (
-	ErrNotDefaultTransport  = errors.New("dns: not a default transport")
-	ErrNoDcProxy            = errors.New("dns: no dnscrypt-proxy")
-	ErrNoProxyProvider      = errors.New("dns: no proxy provider")
-	ErrNoProxyDNS           = errors.New("dns: no proxy")
-	ErrAddFailed            = errors.New("dns: add failed")
-	errNoSuchTransport      = errors.New("dns: missing transport")
-	errTransportEnd         = errors.New("dns: transport ended")
-	errTransportPaused      = errors.New("dns: transport paused")
-	errOnQueryTimeout       = errors.New("dns: timeout fetching query prefs")
-	errOnUpstreamAnsTimeout = errors.New("dns: timeout fetching answer prefs")
-	errBlockFreeTransport   = errors.New("dns: block free transport")
-	errNoRdns               = errors.New("dns: no rdns")
-	errTransportNotMult     = errors.New("dns: not a multi-transport")
-	errTransportNotMDNS     = errors.New("dns: not an mdns transport")
-	errMissingQueryName     = errors.New("dns: no query name")
-	errResolverClosed       = errors.New("dns: closed for business")
+	ErrNotDefaultTransport     = errors.New("dns: not a default transport")
+	ErrNoDcProxy               = errors.New("dns: no dnscrypt-proxy")
+	ErrNoProxyProvider         = errors.New("dns: no proxy provider")
+	ErrNoProxyDNS              = errors.New("dns: no proxy")
+	ErrAddFailed               = errors.New("dns: add failed")
+	errNoSuchTransport         = errors.New("dns: missing transport")
+	errTransportEnd            = errors.New("dns: transport ended")
+	errTransportPaused         = errors.New("dns: transport paused")
+	errOnQueryTimeout          = errors.New("dns: timeout fetching prefs")
+	errOnUpstreamAnswerTimeout = errors.New("dns: timeout fetching prefs for upstream answer")
+	errBlockFreeTransport      = errors.New("dns: block free transport")
+	errNoRdns                  = errors.New("dns: no rdns")
+	errTransportNotMult        = errors.New("dns: not a multi-transport")
+	errTransportNotMDNS        = errors.New("dns: not an mdns transport")
+	errMissingQueryName        = errors.New("dns: no query name")
+	errResolverClosed          = errors.New("dns: closed for business")
 )
 
 type MDNSTransport interface {
@@ -137,8 +132,6 @@ type Transport interface {
 	Query(network string, q *dns.Msg, summary *x.DNSSummary) (*dns.Msg, error)
 	// IPPorts returns all ip:ports of this server.
 	IPPorts() []netip.AddrPort
-	// Relaying returns true if this transport always uses a relay (proxy).
-	Relaying() bool
 	// Stop closes the transport.
 	Stop() error
 }
@@ -147,7 +140,10 @@ type Transport interface {
 type TransportMult interface {
 	x.DNSTransportMult
 	Transport
-	TransportProviderInternal
+}
+
+type TransportMultInternal interface {
+	x.DNSTransportMult
 }
 
 type TransportMultProviderInternal interface {
@@ -160,20 +156,6 @@ type TransportProviderInternal interface {
 	x.DNSTransportProvider
 	// GetInternal returns the internal transport interface for the given ID.
 	GetInternal(id string) (Transport, error)
-}
-
-type Resolver interface {
-	x.DNSTransportMult
-	x.DNSStatusProvider
-	TransportProviderInternal
-	TransportMultProviderInternal
-	ResolverSelf
-	RdnsResolver
-	NatPt
-
-	// Serve reads DNS query from conn and writes DNS answer to conn.
-	// fid is the flow ID that spawned this DNS query, if Origin is "tunnel".
-	Serve(proto string, conn protect.Conn, uid, fid string) (rx, tx int64, errs []error)
 
 	// special purpose pre-defined transports:
 
@@ -181,6 +163,20 @@ type Resolver interface {
 	Gateway() Gateway
 	// MDNS returns the mdns transport, if available; error otherwise.
 	MDNS() (MDNSTransport, error)
+}
+
+type Resolver interface {
+	TransportProviderInternal
+	TransportMultProviderInternal
+	TransportMultInternal
+	ResolverSelf
+	RdnsResolver
+	NatPt
+
+	// IsDnsAddr returns true if the ip:port is resolver's fake endpoint
+	IsDnsAddr(ipport netip.AddrPort) bool
+	// Serve reads DNS query from conn and writes DNS answer to conn
+	Serve(proto string, conn protect.Conn, uid string)
 
 	// StopAll stops all transports.
 	StopAll()
@@ -192,40 +188,28 @@ type Resolver interface {
 type resolver struct {
 	sync.RWMutex // protects transports
 	NatPt
-	ctx  context.Context
-	done context.CancelFunc
-
+	ctx          context.Context
+	done         context.CancelFunc
 	dnsaddrs     []netip.AddrPort
 	transports   map[string]Transport
 	gateway      Gateway
 	localdomains x.RadixTree
-
-	listener   x.DNSListener
-	smms       chan *x.DNSSummary
-	laststatus atomic.Int32
+	listener     x.DNSListener
+	smms         chan *x.DNSSummary
 
 	once   sync.Once
 	closed atomic.Bool
 
 	// mutable fields
-	rdnsl atomic.Pointer[rethinkdnslocal]
-	rdnsr atomic.Pointer[rethinkdns]
-
-	// ipmapper
-	ba *core.Barrier[answer, string]
-}
-
-// Status implements [x.DNSResolver].
-func (h *resolver) Status() int32 {
-	return h.laststatus.Load()
+	rmu   sync.RWMutex // protects rdnsr and rdnsl
+	rdnsl *rethinkdnslocal
+	rdnsr *rethinkdns
 }
 
 var _ Resolver = (*resolver)(nil)
 var _ x.DNSResolver = (*resolver)(nil)
 
 func NewResolver(pctx context.Context, fakeaddrs string, dtr x.DNSTransport, l x.DNSListener, pt NatPt) *resolver {
-	var dtraddr, dtrid string
-
 	ctx, cancel := context.WithCancel(pctx)
 	r := &resolver{
 		ctx:          ctx,
@@ -235,20 +219,15 @@ func NewResolver(pctx context.Context, fakeaddrs string, dtr x.DNSTransport, l x
 		smms:         make(chan *x.DNSSummary, 64),
 		transports:   make(map[string]Transport),
 		localdomains: ipmap.UndelegatedDomainsTrie,
-		ba:           core.NewBarrier[answer](ctx, "r.ipm.bar", battl),
 	}
 	r.loadaddrs(fakeaddrs)
-	r.gateway = NewDNSGateway(r.ctx, r.dnsaddrs, r, pt)
-	if dtr != nil {
-		dtraddr = dtr.GetAddr()
-		dtrid = dtr.ID()
-	}
-	if dtrid != Default {
-		log.W("dns: not default; ignoring %s @ %s", dtrid, dtraddr)
+	r.gateway = NewDNSGateway(ctx, r.dnsaddrs, r, pt)
+	if dtr.ID().V() != Default {
+		log.W("dns: not default; ignoring %s @ %s", dtr.ID(), dtr.GetAddr())
 	} else if tr, ok := dtr.(Transport); !ok {
-		log.W("dns: not a transport; ignoring %s @ %s", dtrid, dtraddr)
+		log.W("dns: not a transport; ignoring", dtr.ID(), dtr.GetAddr())
 	} else {
-		ctr := NewCachingTransport(r.ctx, tr, ttl10m)
+		ctr := NewCachingTransport(tr, ttl10m)
 		r.Lock()
 		r.transports[idstr(tr)] = tr // regular
 		if ctr != nil {
@@ -258,10 +237,10 @@ func NewResolver(pctx context.Context, fakeaddrs string, dtr x.DNSTransport, l x
 		}
 		r.Unlock()
 	}
-	log.I("dns: new! gw? %t; default? %s", r.gateway != nil, dtraddr)
+	log.I("dns: new! gw? %t; default? %s", r.gateway != nil, dtr.GetAddr())
 
 	core.Go("r.Listener", r.sendSummaries)
-	context.AfterFunc(pctx, r.StopAll)
+	context.AfterFunc(ctx, r.StopAll)
 	return r
 }
 
@@ -282,9 +261,8 @@ func (r *resolver) queueSummary(smm *x.DNSSummary) {
 		log.W("dns: fwd: smms closed; dropping %s", smm)
 	default:
 		select {
-		case <-r.ctx.Done(): // DEnd will be stored by StopAll
+		case <-r.ctx.Done():
 		case r.smms <- smm:
-			r.laststatus.Store(smm.Status)
 		default:
 			log.W("dns: fwd: smms full; dropping %s", smm)
 		}
@@ -315,15 +293,7 @@ func (r *resolver) Translate(tr, fix bool) {
 // then deletes it from the map.
 func (r *resolver) stopIfExistsLocked(id string) {
 	if t, ok := r.transports[id]; ok && t != nil {
-		core.Go("r.gateway.stopTid."+id, func() {
-			// hasNotEnded calls t.Status(); it must not run while the
-			// resolver lock is held (it is held by the caller of this
-			// function), because a panic in Status() would wedge the
-			// resolver mutex (see dnscrypt.severbyid). Check the status
-			// off-lock, and stop the captured transport.
-			if !hasNotEnded(t) {
-				return
-			}
+		core.Go("r.gateway.stopTid", func() {
 			err := t.Stop()
 			r.gateway.onStopped(id)
 			log.VV("dns: stop: %s; err? %v", id, err)
@@ -344,7 +314,6 @@ func (r *resolver) Add(dt x.DNSTransport) (ok bool) {
 	}
 	t, ok := dt.(Transport)
 	if !ok { // unlikely
-		log.E("dns: not expected type %T; cannot add %s @ %s", dt, dt.ID(), dt.GetAddr())
 		return false
 	}
 	tid := idstr(t)
@@ -367,33 +336,17 @@ func (r *resolver) Add(dt x.DNSTransport) (ok bool) {
 	}
 
 	caching := false
-	switch t.Type() {
-	case DNSCrypt:
-		// DNSCrypt transports must not be explicitly stopped here
-		// as the stop/start for it is handled DcMulti
-		r.Lock()
-		r.transports[tid] = t
-		if ct := NewCachingTransport(r.ctx, t, ttl10m); ct != nil {
-			ctid := idstr(ct)
-			r.transports[ctid] = ct
-			caching = true
-		}
-		r.Unlock()
-		core.Go("r.onAdd."+tid, func() { r.listener.OnDNSAdded(tid) })
-		ok = true
-	case DNS53, DOH, DOT, ODOH:
+	switch t.Type().V() {
+	case DNS53, DNSCrypt, DOH, DOT, ODOH:
 		r.Lock()
 		// stop existing transport if different
-		if oldt := r.transports[tid]; !core.PtrEq(t, oldt) {
+		if oldt := r.transports[tid]; t != oldt {
 			r.stopIfExistsLocked(tid)
-			// close cache if corresponding tid is closed
-			r.stopIfExistsLocked(CT + tid)
 			r.transports[tid] = t
 		}
 		// always recreate caching transport
-		if ct := NewCachingTransport(r.ctx, t, ttl10m); ct != nil {
+		if ct := NewCachingTransport(t, ttl10m); ct != nil {
 			ctid := idstr(ct)
-			// re-attempt closing cache if closing it above was skipped
 			r.stopIfExistsLocked(ctid)
 			r.transports[ctid] = ct
 			caching = true
@@ -401,23 +354,23 @@ func (r *resolver) Add(dt x.DNSTransport) (ok bool) {
 		r.Unlock()
 
 		if tid == System || tid == Goos {
-			// TODO: add other resolvers?
 			// always add64 after having added the system transport
-			core.Gx("r.Add64."+tid, func() { r.Add64(tid) })
+			core.Gx("r.Add64", func() { r.Add64(tid) })
 		}
 
-		core.Go("r.onAdd."+tid, func() { r.listener.OnDNSAdded(tid) })
-		ok = true
+		core.Go("r.onAdd", func() { r.listener.OnDNSAdded(x.StrOf(tid)) })
+		log.I("dns: add transport %s@%s; caching? %t",
+			t.ID(), t.GetAddr(), caching)
+
+		return true
 	default:
 		log.E("dns: unknown transport(%s) type: %s", t.ID(), t.Type())
 	}
-	log.I("dns: add transport %s@%s; caching? %t",
-		t.ID(), t.GetAddr(), caching)
-	return ok
+	return false
 }
 
-func (r *resolver) GetMult(id string) (x.DNSTransportMult, error) {
-	return r.GetMultInternal(id)
+func (r *resolver) GetMult(id *x.Gostr) (x.DNSTransportMult, error) {
+	return r.GetMultInternal(id.V())
 }
 
 func (r *resolver) GetMultInternal(id string) (TransportMult, error) {
@@ -461,24 +414,17 @@ func (r *resolver) S() string {
 	return r.gateway.S()
 }
 
-func (r *resolver) Get(id string) (x.DNSTransport, error) {
-	return r.GetInternal(id)
+func (r *resolver) Get(id *x.Gostr) (x.DNSTransport, error) {
+	return r.GetInternal(id.V())
 }
 
-func (r *resolver) GetIPs(id string) string {
-	if t, err := r.GetInternal(id); err == nil {
-		return GetIPCsv(t)
-	}
-	return ""
-}
-
-func (r *resolver) Remove(tid string) (ok bool) {
+func (r *resolver) Remove(tid *x.Gostr) (ok bool) {
 	if r.closed.Load() {
 		log.W("dns: remove: closed for business")
 		return false
 	}
 
-	id := tid
+	id := tid.V()
 	// these IDs are reserved for internal use
 	if isReserved(id) {
 		log.I("dns: removing reserved transport %s", id)
@@ -490,7 +436,7 @@ func (r *resolver) Remove(tid string) (ok bool) {
 
 	if hasTransport {
 		if id == System || id == Goos {
-			core.Gx("r.Remove64."+tid, func() { r.Remove64(id) })
+			core.Gx("r.Remove64", func() { r.Remove64(id) })
 		}
 		r.Lock()
 		r.stopIfExistsLocked(id)
@@ -502,52 +448,38 @@ func (r *resolver) Remove(tid string) (ok bool) {
 
 	if tm, err := r.dcProxy(); err == nil { // remove from dc-proxy, if any
 		hasTransport = tm.Remove(tid) || hasTransport
-		hasTransport = tm.Remove(CT+id) || hasTransport
+		hasTransport = tm.Remove(x.StrOf(CT+id)) || hasTransport
 	}
 
 	if tm, err := r.plus(); err == nil { // remove from plus, if any
 		hasTransport = tm.Remove(tid) || hasTransport
-		hasTransport = tm.Remove(CT+id) || hasTransport
+		hasTransport = tm.Remove(x.StrOf(CT+id)) || hasTransport
 	}
 
 	if hasTransport {
-		core.Go("r.onRemove."+tid, func() { r.listener.OnDNSRemoved(id) })
+		core.Go("r.onRemove", func() { r.listener.OnDNSRemoved(x.StrOf(id)) })
 	}
 
 	return hasTransport
 }
 
-// Implements [RdnsResolver].
-func (r *resolver) IsDnsAddrPort(ipport netip.AddrPort) bool {
+func (r *resolver) IsDnsAddr(ipport netip.AddrPort) bool {
 	return r.isDns(ipport)
 }
 
-// Implements [RdnsResolver].
-func (r *resolver) IsDnsAddr(ip netip.Addr) bool {
-	return r.isDnsIp(ip)
-}
-
-// lookup implements [ResolverSelf].
-func (r *resolver) lookup(q *dns.Msg, uid string, tids ...string) (*dns.Msg, string, error) {
-	if q == nil {
+// LookupFor2 implements ResolverSelf.
+func (r *resolver) LookupFor2(q []byte, uid string, tids ...string) ([]byte, string, error) {
+	if len(q) <= 0 {
 		return nil, NoDNS, errNoQuestion
 	}
+	// if len(tids) == 0, use transport from preferences
+	return r.forward(q, OriginInternal, uid, tids...)
+}
 
-	if len(tids) > 0 {
-		// uid may be UNKNOWN_UID_STR if set so by gateway.q()/alg.q();
-		// treat it as an internal lookup for protect.MyUid and
-		// ignore prechosen tids for Default instead
-		if uid == core.UNKNOWN_UID_STR {
-			return r.lookupinternal(q)
-		} else {
-			return r.forward(q, OriginInternal, core.Rand64(), uid, tids...)
-		}
-	}
-
-	// TODO: handle cloned / private space MyUid?
-	// ignore tids provided; lookupinternal always uses Default
-	if uid == protect.MyUid {
-		return r.lookupinternal(q)
+// LookupFor implements ResolverSelf.
+func (r *resolver) LookupFor(q []byte, uid string) ([]byte, string, error) {
+	if len(q) <= 0 {
+		return nil, NoDNS, errNoQuestion
 	}
 
 	// prechose tids preferred & fixed when uid is set to 0, -1, or 1051 (common
@@ -555,57 +487,49 @@ func (r *resolver) lookup(q *dns.Msg, uid string, tids ...string) (*dns.Msg, str
 	// to use "fixed" transport to later uncover the actual requesting app/uid during
 	// tcp/udp flows (specifically, with preflow)
 	if (uid == core.UNKNOWN_UID_STR || uid == core.DNS_UID_STR || uid == core.ANDROID_UID_STR) && r.gateway.fixedTransport() {
-		return r.forward(q, OriginInternal, core.Rand64(), uid, Preferred, Fixed)
+		return r.forward(q, OriginInternal, uid, Preferred, Fixed)
 	}
 
-	return r.forward(q, OriginInternal, core.Rand64(), uid)
+	return r.forward(q, OriginInternal, uid)
 }
 
-// lookupinternal for [OriginInternal] queries on behalf of [protect.MyUid] over [Default].
-func (r *resolver) lookupinternal(q *dns.Msg) (*dns.Msg, string, error) {
+// LocalLookup implements ResovlerSelf.
+func (r *resolver) LocalLookup(q []byte) ([]byte, string, error) {
 	if r.closed.Load() {
 		return nil, NoDNS, errResolverClosed
 	}
 
-	// when loopingback, Goos queries will be sent right back to us
-	goosWillLoopback := settings.Loopingback.Load()
+	loopingBack := settings.Loopingback.Load()
 	defaultIsSystemDNS := r.isDefaultSystemDNS()
 
 	// including dns64 and/or alg
-	ans, tid, err := r.forward(q, OriginInternal, core.Rand64(), protect.MyUid, Default)
-	if !defaultIsSystemDNS || goosWillLoopback {
+	ans, tid, err := r.forward(q, OriginInternal, protect.UidSelf, Default)
+	if !defaultIsSystemDNS || loopingBack {
 		return ans, tid, err
 	} // else: retry with Goos/System, if needed
 
-	// ans may be nil
-	if ans == nil || err != nil || xdns.IsNXDomain(ans) || !xdns.HasRcodeSuccess(ans) {
-		log.I("dns: nxdomain via Default (err? %v); attempting Goos for %s", err, xdns.QName(ans))
-		ans, tid, err = r.forward(q, OriginInternal, core.Rand64(), protect.MyUid, Goos) // Goos is System; see: determineTransport
+	// msg may be nil
+	if msg := xdns.AsMsg(ans); err != nil || xdns.IsNXDomain(msg) || !xdns.HasRcodeSuccess(msg) {
+		log.I("dns: nxdomain via Default (err? %v); attempting Goos for %s", err, xdns.QName(msg))
+		ans, tid, err = r.forward(q, OriginInternal, protect.UidSelf, Goos) // Goos is System; see: determineTransport
 	} // else: rcode success and nil err; do not fallback on Goos/System
 
 	return ans, tid, err
 }
 
-func (r *resolver) forward(q *dns.Msg, who, fid, uid string, chosenids ...string) (res0 *dns.Msg, tid0 string, err0 error) {
+func (r *resolver) forward(q []byte, who, uid string, chosenids ...string) (res0 []byte, tid0 string, err0 error) {
 	starttime := time.Now()
 	ogsmm := &x.DNSSummary{
 		ID:     NoDNS,
-		FID:    fid,
-		Origin: who,
-		Start:  starttime.UnixMilli(),
 		UID:    uid, // may be overwritten to by Cacher via fillSummary
 		QName:  invalidQname,
 		Status: Start,
 		Msg:    errNop.Error(),
 	}
 
-	if len(chosenids) > 0 {
-		ogsmm.Extra = "Prechose: " + strings.Join(chosenids, ";")
-	}
-
-	if q == nil {
-		err := errNoQuestion
-		log.W("dns: fwd: for %s; nil dns packet", uid)
+	msg, err := unpack(q)
+	if err != nil {
+		log.W("dns: fwd: for %s; %d not a dns packet %v", uid, len(q), err)
 		ogsmm.Latency = time.Since(starttime).Seconds()
 		ogsmm.Status = BadQuery
 		ogsmm.Msg = err.Error()
@@ -614,8 +538,8 @@ func (r *resolver) forward(q *dns.Msg, who, fid, uid string, chosenids ...string
 	}
 
 	// figure out transport to use
-	qname := qname(q)
-	qtyp := qtype(q)
+	qname := qname(msg)
+	qtyp := qtype(msg)
 	ogsmm.QName = qname
 	ogsmm.QType = qtyp
 	ogsmm.Targets = qname
@@ -628,66 +552,23 @@ func (r *resolver) forward(q *dns.Msg, who, fid, uid string, chosenids ...string
 		return nil, NoDNS, errMissingQueryName
 	}
 
-	// when PtMode forces protocol translation, resolve AAAA in parallel
-	// so that dns64/nat64 caches are warm for subsequent translations.
-	pt := settings.PtMode.Load()
-	if who == OriginTunnel && xdns.IsAQType(uint16(qtyp)) && ptmodeIsForce(pt) {
-		msg6 := xdns.Request6FromRequest4(q)
-		smm6 := copySummary(ogsmm)
-		smm6.QType = int(dns.TypeAAAA)
-		fid6 := core.Rand64()
-
-		if log.Verbose {
-			log.V("dns: fwd: for %s; force6 for %s:%s:%d; ptmode=%s", uid, fid6, qname, qtyp, pt)
-		}
-
-		core.Gx("r.fwd.aaaa."+fid6+"."+qname, func() {
-			_, _, _ = r.forwardInner(msg6, smm6, who, fid6, uid, chosenids...)
-		})
-	}
-
-	return r.forwardInner(q, ogsmm, who, fid, uid, chosenids...)
-}
-
-func (r *resolver) forwardInner(msg *dns.Msg, ogsmm *x.DNSSummary, who, fid, uid string, chosenids ...string) (*dns.Msg, string, error) {
-	var onQueryDone, onUpstreamAnswerDone float64
-
-	starttime := time.Now()
-
-	qname := ogsmm.QName
-	qtyp := ogsmm.QType
-
-	pref, oqcompleted := core.Grx("r.onQuery."+fid+"."+qname, func(_ context.Context) (*x.DNSOpts, error) {
-		return r.listener.OnQuery(who, uid, qname, qtyp), nil
+	pref, oqcompleted := core.Grx("r.onQuery", func(_ context.Context) (*x.DNSOpts, error) {
+		return r.listener.OnQuery(x.StrOf(who), x.StrOf(uid), x.StrOf(qname), qtyp), nil
 	}, listenerTimeout)
-
-	onQueryDone = time.Since(starttime).Seconds()
-
 	if !oqcompleted || pref == nil {
 		log.W("dns: fwd: for %s; no preferences (%t) for %s:%d", uid, pref == nil, qname, qtyp)
-		ogsmm.Latency = onQueryDone
+		ogsmm.Latency = time.Since(starttime).Seconds()
 		ogsmm.Status = ClientError
 		ogsmm.Msg = errOnQueryTimeout.Error()
 		r.queueSummary(ogsmm)
 		return nil, NoDNS, errOnQueryTimeout
 	}
 
-	prefuid := pref.UID
-	senduid := uid // may be prefuid when oguid is unknown
 	run := 0
-	if ogsmm.UID == core.UNKNOWN_UID_STR {
-		ogsmm.UID = prefuid
-		senduid = prefuid
-	}
-
 	smm := copySummary(ogsmm)
 
 	// TODO? do not use defer func() and do copy: go.dev/play/p/oGUJepa3VUo
 	defer func() {
-		if settings.Debug {
-			smm.Extra = smm.Extra + " / " + core.FmtSecsFloat(smm.Latency)
-			smm.Latency = time.Since(starttime).Seconds()
-		}
 		r.queueSummary(smm) // always call up to the listener
 	}()
 
@@ -695,43 +576,26 @@ runagain:
 	run++
 	*smm = *copySummary(ogsmm)
 
-	log.V("dns: fwd: 1 for %s (fid: %s / %s); query %s:%d, r%d; [prefs:%v; chosen:%v]", uid, fid, who, qname, qtyp, run, pref, chosenids)
+	log.V("dns: fwd: 1 for %s; query %s:%d, r%d; [prefs:%v; chosen:%v]", uid, qname, qtyp, run, pref, chosenids)
 
-	id, sid, pids, spids, diag, presetIPs := r.preferencesFrom(fid, qname, uint16(qtyp), pref, chosenids...)
+	id, sid, pids, presetIPs := r.preferencesFrom(qname, uint16(qtyp), pref, chosenids...)
+	t := r.determineTransport(id) // id may be empty if pref is nil
 
-	t := r.determineTransport(id)         // id may be empty if pref is nil
-	t2 := r.determineTransport(sid)       // sid may be empty
-	hasT1 := t != nil && !core.IsNil(t)   // primary transport
-	hasT2 := t2 != nil && !core.IsNil(t2) // secondary transport
-	hasPre := len(presetIPs) > 0
-	diffT1 := hasT1 && id != idstr(t)
-	diffT2 := hasT2 && sid != idstr(t2)
+	log.V("dns: fwd: 2 for %s; query %s:%d, r%d; [prefs:%v; chosen:%v]; id? %s, sid? %s, pid? %s, ips? %v",
+		uid, qname, qtyp, run, pref, chosenids, id, sid, pids, presetIPs)
 
-	if log.Verbose {
-		log.V("dns: fwd: 2 for %s (fid: %s); query %s:%d, r%d; onQueryTime: %s; [prefs:%v; chosen:%v]; id? %s (%t), sid? %s (%t), pid? %s/%s, ips? %v",
-			uid, fid, qname, qtyp, run, core.FmtSecsFloat(onQueryDone), pref, chosenids, id, hasT1, sid, hasT2, pids, spids, presetIPs)
+	if t == nil || core.IsNil(t) {
+		smm.Latency = time.Since(starttime).Seconds()
+		smm.Status = TransportError
+		smm.Msg = errNoSuchTransport.Error()
+		return nil, NoDNS, errNoSuchTransport
+	}
+	var t2 Transport
+	if len(sid) > 0 {
+		t2 = r.determineTransport(sid)
 	}
 
-	if settings.Debug || (!hasPre && (diffT1 || diffT2)) || !hasT1 {
-		smm.Extra += fmt.Sprintf(" #%d Prefs: %s+%s; Actual: %s+%s over %s/%s; onQ: %s/onA: %s ",
-			run, pref.TIDCSV, pref.TIDSECCSV, id, sid, pids, spids, core.FmtSecsFloat(onQueryDone), core.FmtSecsFloat(onUpstreamAnswerDone))
-	}
-	if len(diag) > 0 {
-		smm.Extra += "{" + diag + "}"
-	}
-
-	if !hasT1 {
-		if !hasT2 {
-			smm.Latency = time.Since(starttime).Seconds()
-			smm.Status = TransportError
-			smm.Msg = strings.Join(append(chosenids, id, sid, errNoSuchTransport.Error()), ";")
-			return nil, NoDNS, errNoSuchTransport
-		}
-		t = t2
-		t2 = nil
-	}
-
-	smm.Type = t.Type()
+	smm.Type = t.Type().V()
 	smm.ID = idstr(t)
 
 	res1, blocklists, err := r.blockQ(t, t2, msg) // skips if the t, t2 are alg/block-free
@@ -739,41 +603,42 @@ runagain:
 		if pref.NOBLOCK { // only add blocklists and do not actually block
 			smm.Blocklists = blocklists
 		} else { // block the query
+			b, e := res1.Pack()
 			smm.Latency = time.Since(starttime).Seconds()
 			smm.Status = Complete
 			smm.Blocklists = blocklists
 			smm.RData = xdns.GetInterestingRData(res1)
-			smm.Msg = errNop.Error()
-			if log.Verbose {
-				log.V("dns: fwd: 3 %s for %s (fid: %s); r%d, query blocked %s:%d by %s",
-					smm.ID, uid, smm.FID, run, qname, qtyp, blocklists)
+			if e != nil {
+				smm.Msg = e.Error()
+			} else {
+				smm.Msg = errNop.Error()
 			}
-			return res1, smm.ID, nil
+			log.V("dns: fwd: 3 for %s; r%d, query blocked %s:%d by %s", uid, run, qname, qtyp, blocklists)
+			return b, smm.ID, e
 		}
-	} else if log.Verbose {
-		log.V("dns: fwd: 4 %s for %s (fid: %s); r%d, query NOT blocked %s:%d; why? %v", smm.ID, uid, smm.FID, run, qname, qtyp, err)
+	} else {
+		log.V("dns: fwd: 4 for %s; r%d, query NOT blocked %s:%d; why? %v", uid, run, qname, qtyp, err)
 	}
 
-	var res2 *dns.Msg
+	var res2 []byte
 	var nonalg, ans1 *dns.Msg // alg'd answer
 
 	// t, t2 could be different from user-selected sid & pid
 	// when sid and pid fallback on Default or System DNS
 	// in which case, selected proxy must be overriden
 	netid := xdns.NetAndProxyID(NetTypeUDP, pids)
-	snetid := xdns.NetAndProxyID(NetTypeUDP, spids)
 
 	// with t2 as the secondary transport, which could be nil
-	nonalg, ans1, err = r.gateway.q(t, t2, presetIPs, who, netid, snetid, uid, msg, smm)
+	nonalg, ans1, err = r.gateway.q(t, t2, presetIPs, netid, uid, msg, smm)
 
 	if smm.Latency <= 0 {
 		smm.Latency = time.Since(starttime).Seconds()
 	}
-	smm.UID = senduid // reset uid as it may have been cleared by cacher
+	smm.UID = uid // reset uid as it may have been cleared by cacher
 
 	if nonalg == nil || err != nil { // TODO: servfail?
 		if isAlgErr(err) { // alg errs not set when gw.translate is off
-			log.W("dns: fwd: 5 %s for %s (fid: %s); r%d, alg error %s for %s:%d", smm.ID, uid, smm.FID, run, err, qname, qtyp)
+			log.W("dns: fwd: for %s; r%d, alg error %s for %s:%d", uid, run, err, qname, qtyp)
 			smm.Status = NoResponse
 		} else if smm.Status == Start {
 			smm.Status = InternalError
@@ -790,7 +655,12 @@ runagain:
 		ans1 = nonalg
 	}
 
-	res2 = ans1
+	res2, err = ans1.Pack()
+	if err != nil {
+		smm.Status = BadResponse // TODO: servfail?
+		smm.Msg = err.Error()
+		return res2, smm.ID, err
+	}
 
 	smm.Targets = xdns.GetTargets(ans1)
 
@@ -816,54 +686,46 @@ runagain:
 		smm.RCode = xdns.Rcode(ans2)
 		smm.RData = xdns.GetInterestingRData(ans2)
 		smm.Status = Complete
-		res2 = ans2
-
-		if log.Verbose {
-			log.V("dns: fwd: 6 for %s[%s] (fid: %s); query %s:%d, r%d, onQueryTime: %s / onAnswerTime: %s, smm[data: %s, status: %d] blocked",
-				smm.ID, uid, smm.FID, qname, qtyp, run, core.FmtSecsFloat(onQueryDone), core.FmtSecsFloat(onUpstreamAnswerDone), smm.RData, smm.Status)
+		res2, err = ans2.Pack()
+		if err != nil {
+			smm.RTtl = 0
+			smm.RCode = dns.RcodeFormatError
+			smm.Status = BadResponse // TODO: servfail?
+			smm.Msg = err.Error()
 		}
+
+		log.V("dns: fwd: 5 for %s[%s]; query %s:%d, r%d, smm[data: %s, status: %d] blocked",
+			smm.ID, uid, qname, qtyp, run, smm.RData, smm.Status)
 		return res2, smm.ID, err
 	}
 
 	realips := Netip2Csv(xdns.IPs(nonalg))
 	ansblocked := xdns.AQuadAUnspecified(ans1)
 
-	if log.Verbose {
-		log.V("dns: fwd: 7 for %s[%s] (fid: %s); query %s:%d, r%d, onQueryTime: %s / onAnswerTime: %s, ips: %s; smm[data: %s, status: %d]; new-ans? %t, blocklists? %t, blocked? %t",
-			smm.ID, uid, smm.FID, qname, qtyp, run, core.FmtSecsFloat(onQueryDone), core.FmtSecsFloat(onUpstreamAnswerDone), realips, smm.RData, smm.Status, isnewans, hasblocklists, ansblocked)
+	if settings.Debug {
+		log.V("dns: fwd: 6 for %s[%s]; query %s:%d, r%d, ips: %s; smm[data: %s, status: %d]; new-ans? %t, blocklists? %t, blocked? %t",
+			smm.ID, uid, qname, qtyp, run, realips, smm.RData, smm.Status, isnewans, hasblocklists, ansblocked)
 	}
 
 	if run == 1 {
-		onUpstreamAnswerStart := time.Now()
-
-		pref2, ouacompleted := core.Grx("r.onUA."+fid+"."+qname, func(_ context.Context) (*x.DNSOpts, error) {
-			return r.listener.OnUpstreamAnswer(who, smm, pref.Copy(), realips), nil
-		}, answerTimeout)
-
-		onUpstreamAnswerDone = time.Since(onUpstreamAnswerStart).Seconds()
-
+		pref2, ouacompleted := core.Grx("r.onUA."+qname, func(_ context.Context) (*x.DNSOpts, error) {
+			return r.listener.OnUpstreamAnswer(smm, x.StrOf(realips)), nil
+		}, listenerTimeout)
 		if !ouacompleted {
-			log.W("dns: fwd: 8 for %s[%s] (fid: %s); onQueryTime: %s, onAnswerTime: %s; preferences2 missing for %s:%d; ips? %s",
-				smm.ID, uid, smm.FID, core.FmtSecsFloat(onQueryDone), core.FmtSecsFloat(onUpstreamAnswerDone), qname, qtyp, realips)
+			log.W("dns: fwd: for %s[%s]; preferences2 missing for %s:%d; ips? %s", smm.ID, uid, qname, qtyp, realips)
 			smm.Status = ClientError
-			smm.Msg = errOnUpstreamAnsTimeout.Error()
+			smm.Msg = errOnUpstreamAnswerTimeout.Error()
 			smm.ID = NoDNS
-			return nil, NoDNS, errOnUpstreamAnsTimeout
+			return nil, NoDNS, errOnUpstreamAnswerTimeout
 		}
 
 		if pref2 != nil && len(pref2.TIDCSV) > 0 && pref2.TIDCSV != pref.TIDCSV {
 			pref = pref2
-			if log.Verbose {
-				log.V("dns: fwd: 9 for %s[%s] (fid: %s); onQueryTime: %s / onAnswerTime: %s; preferences2 changed for %s:%d; ips? %s; new prefs: %v",
-					smm.ID, uid, smm.FID, core.FmtSecsFloat(onQueryDone), core.FmtSecsFloat(onUpstreamAnswerDone), qname, qtyp, realips, pref2)
-			}
 			goto runagain // re-run with new pids
 		}
 
-		if log.Verbose {
-			log.V("dns: fwd: 10 for %s[%s] (fid: %s), r%d; onQueryTime: %s / onAnswerTime: %s; preferences2 skipped for %s:%d [ips? %s]: %v",
-				smm.ID, uid, smm.FID, run, core.FmtSecsFloat(onQueryDone), core.FmtSecsFloat(onUpstreamAnswerDone), qname, qtyp, realips, pref2)
-		}
+		log.V("dns: fwd: 7 for %s[%s], r%d; preferences2 skipped for %s:%d [ips? %s]: %v",
+			smm.ID, uid, run, qname, qtyp, realips, pref2)
 	}
 
 	// return transport ID match w/ ID used by alg.go:registerLocked (alg/nat/ptr caches)
@@ -872,10 +734,9 @@ runagain:
 }
 
 // Serve implements Resolver.
-func (r *resolver) Serve(proto string, c protect.Conn, uid, fid string) (rx, tx int64, errs []error) {
+func (r *resolver) Serve(proto string, c protect.Conn, uid string) {
 	if r.closed.Load() {
-		err := log.EE("dns: serve: closed for business")
-		errs = append(errs, err)
+		log.W("dns: serve: closed for business")
 		return
 	}
 
@@ -888,14 +749,12 @@ func (r *resolver) Serve(proto string, c protect.Conn, uid, fid string) (rx, tx 
 
 	switch proto {
 	case NetTypeTCP:
-		rx, tx, errs = r.accept(c, uid, fid)
+		r.accept(c, uid)
 	case NetTypeUDP:
-		rx, tx, errs = r.reply(c, uid, fid)
+		r.reply(c, uid)
 	default:
-		err := log.EE("dns: %s unknown proto: %s", fid, proto)
-		errs = append(errs, err)
+		log.W("dns: unknown proto: %s", proto)
 	}
-	return
 }
 
 func (r *resolver) determineTransport(id string) Transport {
@@ -907,12 +766,6 @@ func (r *resolver) determineTransport(id string) Transport {
 		d := r.transports[Default]
 		r.RUnlock()
 		return d
-	}
-	if id == Fixed || id == CT+Fixed {
-		r.RLock()
-		f := r.transports[Fixed]
-		r.RUnlock()
-		return f
 	}
 
 	var id0, id1 string
@@ -940,18 +793,6 @@ func (r *resolver) determineTransport(id string) Transport {
 		}
 	} else if isPlus(id) {
 		id0 = Plus // replace a plus transport with its mult equivalent
-	} else if isAnyBlockFree(id) && canUseDefaultDNS(BlockFree) {
-		// use Preferred when BlockFree is not available. BlockFree is only
-		// added for RDNS endpoints; for other transports, the same transport
-		// acts as "BlockFree" provided DNSOpts.NOBLOCK is set to true.
-		id0 = BlockFree
-		// may technically "leak" DNS queries when Split DNS is true
-		// and an app's queries are forced through Preferred
-		id1 = Preferred
-		if strings.HasPrefix(id, CT) {
-			id0 = CT + id0
-			id1 = CT + id1
-		}
 	} else {
 		id0 = id
 	}
@@ -965,95 +806,64 @@ func (r *resolver) determineTransport(id string) Transport {
 	tf = r.transports[Default]
 	r.RUnlock()
 
-	// id1 may be CT+Default which doesn't exist and so tf (Default) must be used
-	isanydefault := isAnyDefault(id0, id1)
 	mayusedefault := canUseDefaultDNS(id0)
 	if t0 != nil && (t1 == nil || !mayusedefault || activeTransport(t0)) {
 		return t0
 	} else if t1 != nil && (!mayusedefault || activeTransport(t1)) {
-		log.W("dns: fwd: %s missing or inactive; using %s instead", id0, id1)
 		return t1
-	} else if tf != nil && (mayusedefault || isanydefault) {
-		log.W("dns: fwd: %s & %s missing or inactive; using default", id0, id1)
+	} else if tf != nil && mayusedefault {
+		log.W("dns: fwd: %s is missing; using default", id0)
 		return tf // todo: assert tf != nil?
 	}
 
-	log.W("dns: fwd: %s & %s missing or inactive; no default", id0, id1)
 	return nil
 }
 
 // dnstcp queries the transport and writes answers to w, prefixed by length.
-func (r *resolver) dnstcp(q []byte, w io.WriteCloser, uid, fid string) (written int, err error) {
-	msg, uerr := unpack(q)
-	if uerr != nil {
-		log.W("dns: tcp: for %s (fid: %s) not a dns packet: %v", uid, fid, uerr)
+func (r *resolver) dnstcp(q []byte, w io.WriteCloser, uid string) error {
+	ans, _, err := r.forward(q, OriginTunnel, uid)
+
+	rlen := len(ans)
+	if rlen <= 0 && err != nil {
 		clos(w) // close on client err
-		return 0, uerr
+		return err
 	}
 
-	ans, _, err := r.forward(msg, OriginTunnel, fid, uid)
-	if ans == nil && err != nil {
-		clos(w) // close on client err
-		return 0, err
-	}
-
-	var b []byte
-	if ans != nil {
-		if b, err = ans.Pack(); err != nil {
-			clos(w) // close on pack err
-			return 0, err
-		}
-	}
-	rlen := len(b)
-
-	if written, err = writePrefixed(w, b, rlen); err != nil {
+	if n, err := writePrefixed(w, ans, rlen); err != nil {
 		clos(w) // close on write back err
-	} else if written != rlen { // do not close on incomplete writes
-		err = fmt.Errorf("dns: tcp: for %s (fid: %s) incomplete write: n(%d) != r(%d)", uid, fid, written, rlen)
+		return err
+	} else if n != rlen {
+		// do not close on incomplete writes
+		return fmt.Errorf("dns: tcp: for %s incomplete write: n(%d) != r(%d)", uid, n, rlen)
 	}
-	return
+	return nil // ok
 }
 
 // dnsudp queries the transport and writes answers to w.
-func (r *resolver) dnsudp(q []byte, w io.Writer, uid, fid string) (written int, err error) {
-	msg, uerr := unpack(q)
-	if uerr != nil {
-		log.W("dns: udp: for %s (fid: %s) not a dns packet: %v", uid, fid, uerr)
-		return 0, uerr
+func (r *resolver) dnsudp(q []byte, w io.WriteCloser, uid string) error {
+	ans, _, err := r.forward(q, OriginTunnel, uid)
+
+	rlen := len(ans)
+	if rlen <= 0 && err != nil {
+		clos(w) // close on client err
+		return err
 	}
 
-	ans, _, err := r.forward(msg, OriginTunnel, fid, uid)
-	if ans == nil && err != nil {
-		// clos(w) // close on client err
-		return 0, err
-	}
-
-	var b []byte
-	if ans != nil {
-		if b, err = ans.Pack(); err != nil {
-			return 0, err
-		}
-	}
-	rlen := len(b)
-
-	if written, err = w.Write(b); err != nil {
-		// clos(w) // close on write back err
-	} else if written != rlen {
+	if n, err := w.Write(ans); err != nil {
+		clos(w) // close on write back err
+		return err
+	} else if n != rlen {
 		// do not close on incomplete writes
-		err = fmt.Errorf("dns: udp: for %s (fid: %s) incomplete write: n(%d) != r(%d)", uid, fid, written, rlen)
+		return fmt.Errorf("dns: udp: for %s incomplete write: n(%d) != r(%d)", uid, n, rlen)
 	}
 
-	return
+	return nil // ok
 }
 
 // reply DNS-over-UDP from a stub resolver.
-func (r *resolver) reply(c protect.Conn, uid, fid string) (rx, tx int64, errs []error) {
+func (r *resolver) reply(c protect.Conn, uid string) {
 	defer clos(c)
 
-	var rxv, txv atomic.Int64
-	var errsMu sync.Mutex
-
-	var wg sync.WaitGroup
 	start := time.Now()
 	cnt := 0
 	for {
@@ -1069,66 +879,45 @@ func (r *resolver) reply(c protect.Conn, uid, fid string) (rx, tx int64, errs []
 		_ = c.SetDeadline(tm)
 
 		if n, err := c.Read(q); err != nil {
-			log.VV("dns: udp: for %s (fid: %s) done; tot: %d, t: %s, err: %v",
-				uid, fid, cnt, core.FmtTimeAsPeriod(start), err)
+			millis := int(time.Since(start).Seconds() * 1000)
+			log.VV("dns: udp: for %s done; tot: %d, t: %dms, err: %v",
+				uid, cnt, millis, err)
 			free()
 			break
 		} else {
-			// capture loop-scoped variables locally so the goroutine closure
-			// does not race with the next iteration reassigning q/free/cnt
-			qs := q[:n]
-			frees := free
-			cnts := cnt
-			wg.Add(1)
-			core.Gx("r.reply.do."+fid, func() {
-				defer wg.Done()
-				defer frees()
-				m, err := r.dnsudp(qs, c, uid, fid)
-				logeif(err != nil)("dns: udp: for %s (fid: %s) err! tot: %d, t: %s, %v",
-					uid, fid, cnts, core.FmtTimeAsPeriod(start), err)
-				rxv.Add(int64(m))
-				txv.Add(int64(n))
-				if err != nil {
-					errsMu.Lock()
-					errs = append(errs, err)
-					errsMu.Unlock()
-				}
+			core.Gx("r.reply.do", func() {
+				defer free()
+				err = r.dnsudp(q[:n], c, uid)
+				millis := int(time.Since(start).Seconds() * 1000)
+				logeif(err != nil)("dns: udp: for %s err! tot: %d, t: %dms, %v",
+					uid, cnt, millis, err)
 			})
 		}
 		cnt++
 	}
-	wg.Wait() // wait to acc rx, tx, errs
-	rx = rxv.Load()
-	tx = txv.Load()
-	log.VV("dns: udp: for %s done; tot: %d (rx: %d, tx: %d), t: %s", uid, cnt, rx, tx, core.FmtTimeAsPeriod(start))
-	return
 }
 
 // Accept a DNS-over-TCP socket from a stub resolver, and connect the socket
 // to this DNSTransport.
-func (r *resolver) accept(c io.ReadWriteCloser, uid, fid string) (rx, tx int64, errs []error) {
+func (r *resolver) accept(c io.ReadWriteCloser, uid string) {
 	defer clos(c)
 
-	var rxv, txv atomic.Int64
-	var errsMu sync.Mutex
-
-	var wg sync.WaitGroup
 	start := time.Now()
 	cnt := 0
 	qlbuf := make([]byte, 2)
 	for {
 		n, err := c.Read(qlbuf)
 		if n == 0 {
-			log.D("dns: tcp: for %s (fid: %s) query socket shutdown", uid, fid)
+			log.D("dns: tcp: for %s query socket shutdown", uid)
 			break
 		}
 		if err != nil {
-			log.W("dns: tcp: for %s (fid: %s) err reading from socket: %v", uid, fid, err)
+			log.W("dns: tcp: for %s err reading from socket: %v", uid, err)
 			break // close on read errs
 		}
 		// TODO: inform the listener?
 		if n < 2 {
-			log.W("dns: tcp: for %s (fid: %s) incomplete query length", uid, fid)
+			log.W("dns: tcp: for %s incomplete query length", uid)
 			break // close on incorrect lengths
 		}
 		qlen := binary.BigEndian.Uint16(qlbuf)
@@ -1143,45 +932,29 @@ func (r *resolver) accept(c io.ReadWriteCloser, uid, fid string) (rx, tx int64, 
 
 		n, err = c.Read(q)
 		if err != nil {
-			log.D("dns: tcp: for %s (fid: %s) done; err: %v", uid, fid, err)
+			log.D("dns: tcp: for %s done; err: %v", uid, err)
 			free()
 			break // close on read errs
 		}
 		if n != int(qlen) {
+			ms := int(time.Since(start).Seconds() * 1000)
+			log.W("dns: tcp: for %s incomplete query: %d < %d; tot: %d, t: %dms",
+				uid, n, qlen, cnt, ms)
 			free()
-			log.W("dns: tcp: for %s (fid: %s) incomplete query: %d < %d; tot: %d, t: %s",
-				uid, fid, n, qlen, cnt, core.FmtTimeAsPeriod(start))
 			break // close on incomplete reads
 		}
-		// capture loop-scoped variables locally so the goroutine closure
-		// does not race with the next iteration reassigning q/free/cnt
-		qs := q[:n]
-		frees := free
-		cnts := cnt
-		wg.Add(1)
-		core.Gx("r.accept.do."+fid, func() {
-			defer wg.Done()
-			defer frees()
-			m, err := r.dnstcp(qs, c, uid, fid)
-			logeif(err != nil)("dns: tcp: for %s (fid: %s) err! tot: %d, t: %s, %v",
-				uid, fid, cnts, core.FmtTimeAsPeriod(start), err)
-			if err != nil {
-				errsMu.Lock()
-				errs = append(errs, err)
-				errsMu.Unlock()
-			}
-			txv.Add(int64(n))
-			rxv.Add(int64(m))
+		core.Gx("r.accept.do", func() {
+			defer free()
+			err = r.dnstcp(q[:n], c, uid)
+			ms := int(time.Since(start).Seconds() * 1000)
+			logeif(err != nil)("dns: tcp: for %s err! tot: %d, t: %dms, %v",
+				uid, cnt, ms, err)
 		})
 		cnt++
 	}
-	wg.Wait()
-	rx = rxv.Load()
-	tx = txv.Load()
-	log.VV("dns: tcp: for %s (fid: %s) done; tot: %d (rx: %d, tx: %d), t: %s",
-		uid, fid, cnt, rx, tx, core.FmtTimeAsPeriod(start))
+	ms := int(time.Since(start).Seconds() * 1000)
+	log.VV("dns: tcp: for %s done; tot: %d, t: %ds", uid, cnt, ms)
 	// TODO: Cancel outstanding queries.
-	return
 }
 
 // StopAll implements TransportMult.
@@ -1189,10 +962,7 @@ func (r *resolver) accept(c io.ReadWriteCloser, uid, fid string) (rx, tx int64, 
 func (r *resolver) StopAll() {
 	r.once.Do(func() {
 		defer core.Go("r.onStop", func() { r.listener.OnDNSStopped() })
-		r.closed.Store(true)
 		r.done()
-
-		defer r.laststatus.Store(DEnd)
 
 		if dc, err := r.dcProxy(); err == nil {
 			_ = dc.Stop()
@@ -1205,14 +975,13 @@ func (r *resolver) StopAll() {
 		// Stop all transports in a separate goroutine to avoid blocking
 		core.Go("r.stopAllTransports", func() {
 			r.Lock()
-			all := maps.Clone(r.transports)
-			clear(r.transports)
-			r.Unlock()
-			for _, tr := range all {
+			for _, tr := range r.transports {
 				_ = tr.Stop()
 				// r.gateway.onStopped(id) is not required
 				// as the entire setup is closed and going away
 			}
+			clear(r.transports)
+			r.Unlock()
 		})
 
 		close(r.smms) // close listener chan
@@ -1238,8 +1007,8 @@ func (r *resolver) refresh() {
 	}
 }
 
-func (r *resolver) Refresh() (string, error) {
-	return r.refreshAll()
+func (r *resolver) Refresh() (*x.Gostr, error) {
+	return x.StrOfFunc(r.refreshAll)
 }
 
 func (r *resolver) refreshAll() (string, error) {
@@ -1251,194 +1020,120 @@ func (r *resolver) refreshAll() (string, error) {
 
 	core.Gx("r.refresh", r.refresh)
 	core.Gx("r.refresh.clearcache", dialers.Clear)
-	s := tr2csv(true /*active*/, r.all())
+	s := tr2csv(r.all())
 	if dc, err := r.dcProxy(); err == nil {
 		if x, err := dc.Refresh(); err == nil {
-			s += "," + x
+			s += "," + x.V()
 		}
 	}
 	if p, err := r.plus(); err == nil {
 		if x, err := p.Refresh(); err == nil {
-			s += "," + x
+			s += "," + x.V()
 		}
 	}
 	return trimcsv(s), nil
 }
 
-func (r *resolver) LiveTransports() string {
+func (r *resolver) LiveTransports() *x.Gostr {
 	if r.closed.Load() {
 		log.W("dns: liveTransports: closed for business")
-		return ""
+		return nil
 	}
-	s := tr2csv(true /*active*/, r.all())
+	s := tr2csv(r.all())
 	if dc, err := r.dcProxy(); err == nil {
 		x := dc.LiveTransports()
-		s += "," + x
+		s += "," + x.V()
 	}
 	if p, err := r.plus(); err == nil {
 		x := p.LiveTransports()
-		s += "," + x
+		s += "," + x.V()
 	}
-	return trimcsv(s)
+	return x.StrOf(trimcsv(s))
 }
 
-func parseAllIPOpts(qtyp uint16, qname, ipcsv string) (ips []netip.Addr, badip, badfam int) {
-	for a := range strings.SplitSeq(ipcsv, ",") {
-		a = strings.TrimSpace(a)
-		if len(a) <= 0 {
-			continue
-		}
-		ip, err := netip.ParseAddr(a)
-		if err != nil || !ip.IsValid() {
-			badip++
-			log.W("dns: pref: skip bad ip %s for %s", a, qname)
-			continue
-		}
-		ips = append(ips, ip) // unmap?
-	}
-	if len(ips) > 0 {
-		ip4s, ip6s := splitIPFamilies(ips)
-		if xdns.IsAQType(qtyp) {
-			ips = ip4s
-		} else if xdns.IsAAAAQType(qtyp) {
-			ips = ip6s
-		} else if xdns.IsHTTPSQType(qtyp) || xdns.IsSVCBQType(qtyp) {
-			// ips are substituted in after answers are received
-			// so qtype checks are not sufficient; leave ips as-is
-			// see: synthesizeOrQuery
-		} else {
-			badfam++
-			ips = nil // mismatch in query type and ip family
-			if log.Debug {
-				log.D("dns: pref: ignore ips for %s; qtype %d not A/AAAA/HTTPS/SVCB", qname, qtyp)
-			}
-		}
-	}
-	return
-}
-
-// parse TIDCSV: <tid>, <tid:pid>, <tid:pid1:pid2>, or csv of such
-func parseAllTidOpts(tidcsv string) ([]string, map[string]string) {
-	tids := []string{}
-	pidmap := make(map[string]string)
-	for v := range strings.SplitSeq(tidcsv, ",") {
-		v = strings.TrimSpace(v)
-		if len(v) <= 0 {
-			continue
-		}
-		if tid, pids := parseTidOpt(v); len(tid) > 0 {
-			tids = append(tids, tid)
-			if len(pids) > 0 {
-				pidmap[tid] = strings.Join(pids, ",")
-			}
-		}
-	}
-	return tids, pidmap
-}
-
-// parseTidOpt parses a TID entry in the format <tid>, <tid:pid>, or <tid:pid1:pid2>.
-func parseTidOpt(entry string) (tid string, pids []string) {
-	parts := strings.Split(entry, ":")
-	if len(parts) <= 0 {
-		return
-	}
-	tid = strings.TrimSpace(parts[0])
-	for _, p := range parts[1:] {
-		if p = strings.TrimSpace(p); len(p) > 0 {
-			pids = append(pids, p)
-		}
-	}
-	return
-}
-
-func (r *resolver) preferencesFrom(fid, qname string, qtyp uint16, s *x.DNSOpts, chosenids ...string) (id1, id2, pidcsv, spidcsv, diag string, ips []netip.Addr) {
-	var x []string               // primary tids parsed from TIDCSV
-	var xx []string              // secondary tids parsed from TIDSECCSV
-	var t1pids map[string]string // tid -> pidcsv (from TIDCSV)
-	var t2pids map[string]string // tid -> pidcsv (from TIDSECCSV)
-	var badips, badfam int
-	var diags []string
-
-	defer func() {
-		diag = strings.Join(diags, ";")
-	}()
-
-	if s == nil { // should never happen; but it has during testing (on End())
-		diags = append(diags, "nil prefs")
-		log.W("dns: pref: %s no ns opts for %s", fid, qname)
+func (r *resolver) preferencesFrom(qname string, qtyp uint16, s *x.DNSOpts, chosenids ...string) (id1, id2, pidcsv string, ips []netip.Addr) {
+	var x []string  // primary
+	var xx []string // secondary
+	if s == nil {   // should never happen; but it has during testing (on End())
+		log.W("dns: pref: no ns opts for %s", qname)
 		return // no-op
 	} else {
-		x, t1pids = parseAllTidOpts(s.TIDCSV)
-		xx, t2pids = parseAllTidOpts(s.TIDSECCSV)
-
-		ips, badips, badfam = parseAllIPOpts(qtyp, qname, s.IPCSV)
-		if badips > 0 || badfam > 0 {
-			diags = append(diags, fmt.Sprintf("%d invalid ips / %d invalid fam", badips, badfam))
+		x = strings.Split(s.TIDCSV, ",")
+		xx = strings.Split(s.TIDSECCSV, ",")
+		if y := strings.Split(s.IPCSV, ","); len(y) > 0 {
+			ips = make([]netip.Addr, 0, len(y))
+			for _, a := range y {
+				a = strings.TrimSpace(a)
+				if len(a) <= 0 {
+					continue
+				}
+				ip, err := netip.ParseAddr(a)
+				if err != nil || !ip.IsValid() {
+					log.W("dns: pref: skip bad ip %s for %s", a, qname)
+					continue
+				}
+				ips = append(ips, ip) // unmap?
+			}
 		}
-		if log.Verbose {
-			log.VV("dns: pref: %s tids for %s: p=%v s=%v", fid, qname, x, xx)
+		if len(ips) > 0 {
+			ip4s, ip6s := splitIPFamilies(ips)
+			if xdns.IsAQType(qtyp) {
+				ips = ip4s
+			} else if xdns.IsAAAAQType(qtyp) {
+				ips = ip6s
+			} else if xdns.IsHTTPSQType(qtyp) || xdns.IsSVCBQType(qtyp) {
+				// ips are substituted in after answers are received
+				// so qtype checks are not sufficient
+				// see: synthesizeOrQuery
+			} else {
+				ips = nil // mismatch in query type and ip family
+			}
 		}
 	}
 
-	// TODO: ok if len(ips) > 0?
 	if len(x) <= 0 { // x may be nil
-		log.W("dns: pref: %s no tids for %s (sec? %v)", fid, qname, xx)
-		diags = append(diags, "no tids")
+		log.W("dns: pref: no tids for %s", qname)
 		// no-op
 	} else {
-		// TODO: fallback on all id1s
-		id1 = r.chooseOne(qname+fid, true /*at random*/, x...)
-		id2 = r.chooseOne(qname+fid, true /*at random*/, xx...) // mostly, just 0 or 1 secondary
-		if log.Verbose {
-			log.VV("dns: pref: %s chosen tids for %s: p=%s s=%s / chosen=%v", fid, qname, id1, id2, chosenids)
-			diags = append(diags, fmt.Sprintf("selected(%s,%s)", id1, id2))
-		}
+		id1 = r.chooseOne(x...)
+		id2 = r.chooseOne(xx...) // mostly, just 0 or 1 secondary
 	}
 
 	if !firstEmpty(chosenids) && len(chosenids) > 0 {
-		diags = append(diags, fmt.Sprintf("req(%s,%s)", id1, id2))
 		// chosen ID overrides all except:
 		if (isPlus(id1) || isPlus(id2)) && isAnyDefault(chosenids...) {
 			// Plus overrides Default
 			id1 = Plus
 			id2 = ""
-			diags = append(diags, "plus over default")
-			if log.Debug {
-				log.D("dns: pref: %s use Plus instead of Default for %s", fid, qname)
-			}
+			log.D("dns: pref: use Plus instead of Default for %s", qname)
 		} else {
 			id1 = chosenids[0] // never empty
 			id2 = ""           // wipe out id2 if not set; use just id1
 			if len(chosenids) > 1 {
 				id2 = chosenids[1] // may be empty, but that's ok
 			}
-			diags = append(diags, fmt.Sprintf("chosen(%s,%s)", id1, id2))
-			if log.Debug {
-				log.D("dns: pref: %s use chosen tr(%s, %s) for %s", fid, id1, id2, qname)
-			}
+			log.D("dns: pref: use chosen tr(%s, %s) for %s", id1, id2, qname)
 		}
+	} else if isAnyIPUnspecified(ips) || isAnyBlockAll(x...) {
+		// BlockAll must appear in primary TIDCSV
+		id1 = BlockAll // just one transport, BlockAll, if set
+		id2 = ""
 	} else if reqid := r.requiresGoosOrLocal(qname); len(reqid) > 0 {
 		// use approp transport given a qname
-		log.D("dns: pref: %s use suggested tr(%s) for %s", fid, reqid, qname)
+		log.D("dns: pref: use suggested tr(%s) for %s", reqid, qname)
 		id1 = reqid
 		id2 = ""
-		diags = append(diags, fmt.Sprintf("local(%s)", qname))
 	} else if isAnyFixed(x...) || isAnyFixed(xx...) {
-		if id1 != Fixed && id1 != CT+Fixed { // Fixed must always be the primary transport
+		if id1 != Fixed { // Fixed must always be the primary transport
 			id2 = id1
-			id1 = Fixed
-		}
-		if id1 == CT+Fixed { // Fixed has no cached transport
 			id1 = Fixed
 		}
 		if len(id2) <= 0 {
 			id2 = Preferred
 		}
-		if log.Verbose {
-			log.VV("dns: pref: %s use fixed tr(%s, %s) for %s", fid, id1, id2, qname)
-		}
+		log.VV("dns: pref: use fixed tr(%s, %s) for %s", id1, id2, qname)
 		// s.NOBLOCK must be respected
-		// as must be the pids
+		// s.PIDCSV must be respected
 	}
 	if len(ips) > 0 {
 		log.D("dns: pref: preset ips (no block) %v for %s", ips, qname)
@@ -1449,49 +1144,11 @@ func (r *resolver) preferencesFrom(fid, qname string, qtyp uint16, s *x.DNSOpts,
 		id1 = Local
 		id2 = ""
 	}
-	ipblock := isAnyIPUnspecified(ips)
-	trblock := isAnyBlockAll(id1, id2)
-	reqblock := isAnyBlockAll(x...) || isAnyBlockAll(xx...)
-	if isAnyBlockFree(id1, id2) {
-		if !s.NOBLOCK {
-			log.W("dns: pref: %s tr for %s over %s+%s; override NOBLOCK", fid, qname, id1, id2)
-			s.NOBLOCK = true
-		}
-	} else if ipblock || trblock || reqblock {
-		diags = append(diags, fmt.Sprintf("block(ip?%t, tr?%t, req?%t)", ipblock, trblock, reqblock))
-		log.D("dns: pref: %s tr for %s over %s+%s; block ip? %t, pref? %t, chose? %t",
-			fid, qname, id1, id2, ipblock, trblock, reqblock)
-		// BlockAll must appear in primary TIDCSV
-		id1 = BlockAll // just one transport, BlockAll, if set
-		id2 = ""
-	}
 
-	// pidcsv: PIDs for the primary transport (t1) from TIDCSV.
-	// spid: PIDs for the secondary transport (t2) from TIDSECCSV.
-	if pid, ok := t1pids[id1]; ok && len(pid) > 0 {
-		pidcsv = overrideProxyIfNeeded(pid, id1, id2)
-	} else if pid, ok := t1pids[id2]; ok && len(pid) > 0 && id1 != id2 {
-		// id2 may have TIDCSV PIDs after Fixed swap
-		pidcsv = overrideProxyIfNeeded(pid, id1, id2)
-		if pidcsv != pid {
-			diags = append(diags, fmt.Sprintf("pid %s <> %s", pidcsv, pid))
-			if log.Debug {
-				log.D("dns: pref: %s override pidcsv to %s for %s; tr(%s, %s)", fid, pidcsv, qname, id1, id2)
-			}
-		}
+	if len(s.PIDCSV) > 0 {
+		pidcsv = overrideProxyIfNeeded(s.PIDCSV, id1, id2)
 	} else {
-		pidcsv = NetBaseProxy
-	}
-	if pid, ok := t2pids[id2]; ok && len(pid) > 0 {
-		spidcsv = overrideProxyIfNeeded(pid, id1, id2)
-		if spidcsv != pid {
-			diags = append(diags, fmt.Sprintf("pid %s <> %s", spidcsv, pid))
-			if log.Debug {
-				log.D("dns: pref: %s override spid to %s for %s; tr(%s, %s)", fid, spidcsv, qname, id1, id2)
-			}
-		}
-	} else {
-		spidcsv = NetBaseProxy
+		pidcsv = NetNoProxy
 	}
 	return
 }
@@ -1503,122 +1160,71 @@ func (r *resolver) requiresGoosOrLocal(qname string) (id string) {
 		// todo: remove this once we let users "pin" domains to resolvers
 		// github.com/celzero/rethink-app/issues/1153
 		// skip override when preventing DNS capture on port53 is turned off
-	} else if len(qname) > 0 && r.localdomains.HasAny(qname) {
+	} else if len(qname) > 0 && r.localdomains.HasAny(x.StrOf(qname)) {
 		id = Goos // system is primary; see: transport.go:determineTransports()
 	}
 	return
 }
 
-func (r *resolver) chooseOne(who string, chooseRandom bool, ids ...string) (theone string) {
+func (r *resolver) chooseOne(ids ...string) (theone string) {
 	if len(ids) <= 0 {
 		return ""
+	}
+	if isAnyPlus(ids...) { // prefer Plus, if set
+		return Plus
 	}
 	if len(ids) == 1 {
 		return ids[0]
 	}
 
-	miss := make([]string, 0)
 	trs := make([]Transport, 0, len(ids))
-	hasPlus := false
 	r.RLock()
 	for _, id := range ids {
 		id = strings.TrimSpace(id)
 		if t := r.transports[id]; t != nil {
 			trs = append(trs, t)
-			if isPlus(id) {
-				hasPlus = true
-			}
-		} else {
-			miss = append(miss, id)
 		}
 	}
 	r.RUnlock()
 
-	// TODO: prefer proxy DNS (wg) when available
-	remote, rerecov, best, preferred, recoverables, errored, ended := Categorize(trs)
-	if log.Debug {
+	best, preferred, recoverables, errored, ended := Categorize(trs)
+	if settings.Debug {
 		defer func() {
-			loged(len(theone) <= 0)("dns: pref: %s chose: %s from remote(%v) remoterecov(%v) best(%v) prefer(%v) recov(%v) err(%v) dead(%v) miss(%v)",
-				who, theone, tr2csv2(remote), tr2csv2(rerecov), tr2csv2(best), tr2csv2(preferred), tr2csv2(recoverables), tr2csv2(errored), tr2csv2(ended), strings.Join(miss, ","))
+			loged(len(theone) <= 0)("dns: pref: chose: %s from best(%v) prefer(%v) recov(%v) err(%v) dead(%v)",
+				theone, best, preferred, recoverables, errored, ended)
 		}()
 	}
 
-	if len(remote) > 0 { // prefer Remote, if set
-		if chooseRandom {
-			// TODO: choose with ProxyTo, which checks for proxy health
-			return idstr(core.ChooseOne(remote))
-		}
-		return idstr(remote[0])
-	} else if len(rerecov) > 0 { // prefer Recovered, if set
-		if chooseRandom {
-			return idstr(core.ChooseOne(rerecov))
-		}
-		return idstr(rerecov[0])
-	}
-
-	if hasPlus { // prefer Plus when its transport was found and nothing better is available
-		return Plus
-	}
-
 	if len(best) > 0 {
-		if chooseRandom {
-			return idstr(core.ChooseOne(best))
-		}
 		return idstr(best[0])
 	} else if len(preferred) > 0 {
-		if chooseRandom {
-			return idstr(core.ChooseOne(preferred))
-		}
 		return idstr(preferred[0])
 	} else if len(recoverables) > 0 {
-		if chooseRandom {
-			return idstr(core.ChooseOne(recoverables))
-		}
-		return idstr(recoverables[0])
+		return idstr(core.ChooseOne(recoverables))
 	} else if len(errored) > 0 {
-		if chooseRandom {
-			return idstr(core.ChooseOne(errored))
-		}
-		return idstr(errored[0])
+		return idstr(core.ChooseOne(errored))
 	}
-	log.E("dns: pref: %s no transports for %v (%d) [missed? %v / ended? %v]", who, ids, len(ids), miss, ended)
+	log.E("dns: pref: no transports for %v [all ended? %v]", ids, ended)
 	return ""
 }
 
-func Categorize(ts []Transport) (remote, rerecov, best, preferred, recoverables, errored, ended []Transport) {
+func Categorize(ts []Transport) (best []Transport, preferred []Transport, recoverables []Transport, errored []Transport, ended []Transport) {
 	for _, t := range ts {
-		st := t.Status()
-		// TODO: implement t.HasRelay instead
-		if t.Relaying() {
-			switch st {
-			case Complete, Start, Unpaused:
-				remote = append(remote, t)
-			case NoResponse, BadQuery, BadResponse, InternalError, TransportError:
-				rerecov = append(rerecov, t)
-			case DEnd, Paused, Unknown: // discard non-active transports
-				ended = append(ended, t)
-			default: // ClientError, SendFailed
-				errored = append(errored, t)
-			}
-		} else {
-			switch st {
-			case Complete:
-				best = append(best, t)
-			case Start, Unpaused, NoResponse, BadQuery:
-				preferred = append(preferred, t)
-			case BadResponse:
-				preferred = append(preferred, t)
-			case InternalError, TransportError:
-				recoverables = append(recoverables, t)
-			case DEnd, Paused, Unknown: // discard non-active transports
-				ended = append(ended, t)
-			default: // ClientError, SendFailed
-				errored = append(errored, t)
-			}
+		switch t.Status() {
+		case Complete:
+			best = append(best, t)
+		case Start, NoResponse, BadQuery:
+			preferred = append(preferred, t)
+		case BadResponse:
+			preferred = append(preferred, t)
+		case InternalError, TransportError:
+			recoverables = append(recoverables, t)
+		case DEnd, Paused, Unknown: // discard non-active transports
+			ended = append(ended, t)
+		default: // ClientError, SendFailed
+			errored = append(errored, t)
 		}
 	}
-	best = core.Sort(best, Fastest)
-	preferred = core.Sort(preferred, Fastest)
 	return
 }
 
@@ -1661,11 +1267,11 @@ func IsAutoProxy(pid string) bool {
 
 // RegisterAddrs registers IP ports with all dialers for a given hostname.
 // If id is dnsx.Bootstrap, the hostname is "protected" from re-resolutions.
-// hostname is a domain name, and as a special case, can be [protect.Selfhost]
-// or [protect.Systemhost]. See also: [dialers.For].
+// hostname is a domain name, and as a special case, can be protect.UidSelf or protect.UidSystem.
 func RegisterAddrs(id, hostname string, ipps []string) (ok bool) {
 	var ipset *ipmap.IPSet
 	var addrs []netip.Addr
+	id, _ = strings.CutPrefix(id, CT)
 	if isProtected(id) {
 		log.I("dns: protected %s! %s => %v", id, hostname, ipps)
 		ipset, ok = dialers.NewProtected(hostname, ipps)
@@ -1688,7 +1294,7 @@ func Fastest(a, b Transport) int {
 }
 
 func IsEncrypted(t Transport) bool {
-	return t != nil && isEncrypted(t.Type())
+	return t != nil && isEncrypted(t.Type().V())
 }
 
 func isEncrypted(t string) bool {
@@ -1696,7 +1302,6 @@ func isEncrypted(t string) bool {
 }
 
 func isProtected(id string) bool {
-	id, _ = strings.CutPrefix(id, CT)
 	return id == Bootstrap || id == System || id == Default || id == Local || isPlus(id)
 }
 
@@ -1727,17 +1332,12 @@ func canUseDefaultDNS(id string) bool {
 	return false
 }
 
-// Also accounts for prefixes such as CT+ID
 func isTransportID(match string, ids ...string) bool {
-	return slices.Contains(ids, match) || slices.Contains(ids, CT+match)
+	return slices.Contains(ids, match)
 }
 
 func isAnyBlockAll(ids ...string) bool {
 	return isTransportID(BlockAll, ids...)
-}
-
-func isAnyBlockFree(ids ...string) bool {
-	return isTransportID(BlockFree, ids...)
 }
 
 func isAnyFixed(ids ...string) bool {
@@ -1757,14 +1357,14 @@ func isAnyLocal(ids ...string) bool {
 	return isTransportID(Local, ids...)
 }
 
+func isAnyPlus(ids ...string) bool {
+	return slices.ContainsFunc(ids, isPlus)
+}
+
 func isAnyDefault(ids ...string) bool {
 	return isTransportID(Default, ids...)
 }
 
-// CanUseProxy returns true if transport with id can be safely proxied over another network.
-// For example, Goos, Local, System cannot be. Preset is a transport that needn't be.
-// Default and Bootstrap can be proxied if they are not mapped to System/Goos, or
-// if proxying is allowed (via setting) for Default.
 func CanUseProxy(id string) bool {
 	switch id {
 	case Goos, CT + Goos, Local, CT + Local, System, CT + System:
@@ -1772,15 +1372,12 @@ func CanUseProxy(id string) bool {
 	case Preset, CT + Preset:
 		return false
 	case Default, CT + Default, Bootstrap, CT + Bootstrap:
-		// note that, if Default is System DNS, then upstream.go
-		// will not proxy even if CanUseProxy returns true, and pid is set.
 		return canProxyDefault()
 	}
 	return true
 }
 
 func overrideProxyIfNeeded(pid string, ids ...string) string {
-	// TODO: if in proxy lockdown + loopback mode, do not override
 	for _, id := range ids {
 		switch id {
 		// notes:
@@ -1792,9 +1389,9 @@ func overrideProxyIfNeeded(pid string, ids ...string) string {
 		case CT + Goos, CT + Local: // exit
 			return NetExitProxy
 		case System, Preset: // base
-			return NetBaseProxy // TODO: exit if loopback?
+			return NetBaseProxy
 		case CT + System, CT + Preset: // base
-			return NetBaseProxy // exit if loopback?
+			return NetBaseProxy
 		case Default, CT + Default, Bootstrap, CT + Bootstrap: // may be proxy
 			return proxyForDefault(pid)
 		}
@@ -1823,7 +1420,7 @@ func (r *resolver) isDefaultSystemDNS() (y bool) {
 	if dtr, _ := r.GetInternal(Default); dtr != nil {
 		// todo: a better way to determine whether Default is SystemDNS
 		// Default is usually SystemDNS if it is of type DNS53
-		y = dtr.Type() == DNS53
+		y = dtr.Type().V() == DNS53
 	}
 	return
 }
@@ -1843,7 +1440,7 @@ func proxyForDefault(pid string) string {
 	if canProxyDefault() {
 		return pid
 	}
-	return NetBaseProxy // TODO: Exit if loopback?
+	return NetBaseProxy
 }
 
 func skipInternalCache(tids ...string) bool {
@@ -1866,44 +1463,21 @@ func qtype(msg *dns.Msg) int {
 	return int(xdns.QType(msg))
 }
 
-func tr2csv(activeOnly bool, ts []Transport) string {
-	var s strings.Builder
+func tr2csv(ts []Transport) string {
+	s := ""
 	for _, t := range ts {
-		if !activeOnly || activeTransport(t) {
-			s.WriteString(idstr(t))
-			s.WriteString(",")
+		if activeTransport(t) {
+			s += idstr(t) + ","
 		}
 	}
-	return trimcsv(s.String())
-}
-
-func tr2csv2(ts []Transport) string {
-	return tr2csv(false /*activeOnly*/, ts)
+	return trimcsv(s)
 }
 
 func trimcsv(s string) string {
 	return strings.Trim(s, ",")
 }
 
-func CryptoPrefix(nopki, ech bool) string {
-	if !settings.Debug {
-		return ""
-	}
-
-	if nopki {
-		return noPkiPrefix
-	}
-	if ech {
-		return echPrefix
-	}
-	return ""
-}
-
-func TransportPrefix(id string) string {
-	if !settings.Debug {
-		return ""
-	}
-
+func PrefixFor(id string) string {
 	switch id {
 	case CT:
 		return cacheprefix
@@ -1936,13 +1510,9 @@ func asCachedTransport(t Transport) Cacher {
 
 func cachedTransport(t Transport) bool {
 	return strings.HasSuffix(idstr(t), CT) ||
-		strings.HasPrefix(t.GetAddr(), cacheprefix)
+		strings.HasPrefix(t.GetAddr().V(), cacheprefix)
 }
 
-// WillErr fetches current status and returns if t will
-// error out due to dnsx.DEnd or dnsx.Paused states.
-// It always calls into t.Status(), which has a chance to
-// rectify if its entered incorrect states, if any.
 func WillErr(t Transport) *QueryError {
 	switch t.Status() {
 	case DEnd:
@@ -1958,18 +1528,8 @@ func isPlus(id string) bool {
 }
 
 func activeTransport(t Transport) bool {
-	return isActiveStatus(t.Status())
-}
-
-func isActiveStatus(st int32) bool {
+	st := t.Status()
 	return st != DEnd && st != Paused && st != Unknown
-}
-
-func hasNotEnded(t Transport) bool {
-	if t == nil {
-		return false
-	}
-	return t.Status() != DEnd
 }
 
 func clos(c io.Closer) {
@@ -1978,27 +1538,4 @@ func clos(c io.Closer) {
 
 func firstEmpty(arr []string) bool {
 	return len(arr) <= 0 || len(arr[0]) <= 0
-}
-
-// GetIPCsv converts a slice of AddrPort to a csv string.
-func GetIPCsv(t Transport) string {
-	ipp := t.IPPorts()
-	if len(ipp) <= 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for i, p := range ipp {
-		if !p.IsValid() {
-			continue
-		}
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(p.Addr().String())
-	}
-	return sb.String()
-}
-
-func ptmodeIsForce(pt int32) bool {
-	return pt == settings.PtModeForce || pt == settings.PtModeForce46 || pt == settings.PtModeForce64
 }

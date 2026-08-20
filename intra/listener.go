@@ -11,22 +11,23 @@ import (
 	"net/netip"
 	"time"
 
+	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/ipn"
 )
 
-// FlowSummary reports information about each TCP connection,
+// SocketSummary reports information about each TCP socket
 // or a non-DNS UDP association, or ICMP echo when it is closed.
-type FlowSummary struct {
+type SocketSummary struct {
 	// tcp, udp, or icmp.
 	Proto string
-	// Unique ID for this flow.
+	// Unique ID for this socket.
 	ID string
-	// Proxy ID that handled this flow.
+	// Proxy ID that handled this socket.
 	PID string
 	// Relay Proxy ID that tunneled PID.
 	RPID string
-	// UID of the app that owns this flow (sans ICMP).
+	// UID of the app that owns this socket (sans ICMP).
 	UID string
 	// Source IP.
 	Source string
@@ -46,10 +47,10 @@ type FlowSummary struct {
 	Msg string
 }
 
-type FlowListener interface {
+type SocketListener interface {
 	// Preflow is called before a new connection is established; return owner "uid", which is
 	// later used by dnsx.Resolver to determine the DNS transport to use for that "uid".
-	Preflow(protocol, uid int32, src, dst string) *PreMark
+	Preflow(protocol, uid int32, src, dst *x.Gostr) *PreMark
 	// Flow is called on a new connection; return Proxy IDs to forward the connection
 	// to a pre-registered proxy; "Base" or "Exit" to allow the connection; "Block" to block it.
 	// "connid" is used to uniquely identify a connection across all proxies, and a summary of the
@@ -64,18 +65,17 @@ type FlowListener interface {
 	// domains is a comma-separated list of domain names associated with origdsts, if any.
 	// probableDomains is a comma-separated list of probable domain names associated with origdsts, if any.
 	// blocklists is a comma-separated list of rdns blocklist names that apply, if any.
-	// dstIsAlg is true if the destination is an alg'd IP (which is only valid within the tunnel & will not be used for dialing).
-	Flow(protocol, uid int32, src, dst, origdsts, domains, probableDomains, blocklists string, dstIsAlg bool) *Mark
+	Flow(protocol, uid int32, src, dst, origdsts, domains, probableDomains, blocklists *x.Gostr) *Mark
 	// Inflow is called on a new incoming connection. Returned *Mark values have no discernable effect on these connections,
-	// except for the CID field, which is sent back via Postflow, and "Block" proxy which
+	// except for the CID field, which is sent back via OnSocketClosed, and "Block" proxy which
 	// will drop this connection on the floor.
-	Inflow(protocol, uid int32, src, dst string) *Mark
-	// Flowing is called after a flow is marked by Flow or Inflow.
+	Inflow(protocol, uid int32, src, dst *x.Gostr) *Mark
+	// PostFlow is called after a flow is marked by Flow or Inflow.
 	// It denotes the final Mark that was applied to the flow.
 	// The only major discernable effect is PIDCSV has a single PID.
-	Flowing(m *Mark)
-	// Postflow reports summary after flow closes.
-	Postflow(*FlowSummary)
+	PostFlow(m *Mark)
+	// OnSocketClosed reports summary after a socket closes.
+	OnSocketClosed(*SocketSummary)
 }
 
 type PreMark struct {
@@ -117,8 +117,8 @@ var _ error = noerror{}
 
 func (noerror) Error() string { return "no error" }
 
-func icmpSummary(id, uid string) *FlowSummary {
-	return &FlowSummary{
+func icmpSummary(id, uid string) *SocketSummary {
+	return &SocketSummary{
 		Proto: ProtoTypeICMP,
 		ID:    id,
 		UID:   uid,
@@ -127,8 +127,8 @@ func icmpSummary(id, uid string) *FlowSummary {
 	}
 }
 
-func tcpSummary(id, uid string, src, dst netip.Addr) *FlowSummary {
-	return &FlowSummary{
+func tcpSummary(id, uid string, src, dst netip.Addr) *SocketSummary {
+	return &SocketSummary{
 		Proto:  ProtoTypeTCP,
 		ID:     id,
 		UID:    uid,
@@ -139,13 +139,13 @@ func tcpSummary(id, uid string, src, dst netip.Addr) *FlowSummary {
 	}
 }
 
-func udpSummary(id, uid string, src, dst netip.Addr) *FlowSummary {
+func udpSummary(id, uid string, src, dst netip.Addr) *SocketSummary {
 	s := tcpSummary(id, uid, src, dst)
 	s.Proto = ProtoTypeUDP
 	return s
 }
 
-func (s *FlowSummary) postMark() *Mark {
+func (s *SocketSummary) postMark() *Mark {
 	if s == nil {
 		return nil
 	}
@@ -158,21 +158,21 @@ func (s *FlowSummary) postMark() *Mark {
 }
 
 // String implements fmt.Stringer.
-func (s *FlowSummary) String() string {
+func (s *SocketSummary) String() string {
 	if s != nil {
-		return fmt.Sprintf("%s: id=%s pid=%s:%s uid=%s to=%s down=%s up=%s dur=%s synack=%s msg=%s",
+		return fmt.Sprintf("socket-summary: %s: id=%s pid=%s:%s uid=%s to=%s down=%s up=%s dur=%s synack=%s msg=%s",
 			s.Proto, s.ID, s.PID, s.RPID, s.UID, s.Target, core.FmtBytes(uint64(s.Rx)), core.FmtBytes(uint64(s.Tx)), core.FmtMillis(s.Duration), core.FmtMillis(s.Rtt), s.Msg)
 	}
 	return "<nil>"
 }
 
-func (s *FlowSummary) elapsed() {
+func (s *SocketSummary) elapsed() {
 	if s != nil {
 		s.Duration = time.Since(s.start).Milliseconds()
 	}
 }
 
-func (s *FlowSummary) done(errs ...error) *FlowSummary {
+func (s *SocketSummary) done(errs ...error) *SocketSummary {
 	if s == nil {
 		return nil
 	}

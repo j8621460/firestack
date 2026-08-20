@@ -8,16 +8,14 @@ package ipn
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -26,81 +24,28 @@ import (
 	"github.com/celzero/firestack/intra/core"
 	"github.com/celzero/firestack/intra/dialers"
 	"github.com/celzero/firestack/intra/log"
-	"github.com/celzero/firestack/intra/settings"
 )
 
 const (
-	defaultIPinfoURL    = "https://dl.rethinkdns.com/ip"
-	defaultWsGeoURL     = "https://api.windscribe.net/GeoGreet"
 	defaultTraceURL     = "https://sky.rethinkdns.com/cdn-cgi/trace"
 	defaultWarpURL      = "https://redir.nile.workers.dev/p/warp"
 	defaultMullvadV4URL = "https://ipv4.am.i.mullvad.net/json"
 	defaultMullvadV6URL = "https://ipv6.am.i.mullvad.net/json"
 	maxIPBodySize       = int64(128 * 1024)
-	maxHttpTimeout      = 10 * time.Second
-	httpResponseTimeout = 3 * time.Second
+	httpTimeout         = 10 * time.Second
 )
 
 // test hooks
 var (
-	ipinfoURL    = defaultIPinfoURL
-	wsGeoURL     = defaultWsGeoURL
 	traceURL     = defaultTraceURL
 	warpURL      = defaultWarpURL
 	mullvadV4URL = defaultMullvadV4URL
 	mullvadV6URL = defaultMullvadV6URL
 
-	skipWsForTesting      = false
-	skipIPinfoForTesting  = false
 	skipTraceForTesting   = false
 	skipWarpForTesting    = false
 	skipMullvadForTesting = false
 )
-
-var globalWsFakeBearer string
-
-const (
-	maxIpmetaLifetime = 1 * time.Hour
-	minIpmetaLifetime = 12 * time.Minute
-)
-
-type ipmeta struct {
-	id uint64
-	*x.IPMetadata
-}
-
-var ipm = core.NewExpiringMap[string, *ipmeta](context.Background(), "ipn.pxc.ipm")
-
-// ClearIPMeta clears the cached IP metadata for all proxies.
-func ClearIPMeta() {
-	ipm.Clear()
-}
-
-func getCachedIPMeta(p Proxy, network string) *x.IPMetadata {
-	key := p.ID() + "/" + network + "/" + p.GetAddr()
-	handle := p.DialerHandle()
-	e, fresh := ipm.V(key)
-	if !fresh || e == nil {
-		return nil
-	}
-	if e.id != handle {
-		ipm.Delete(key)
-		return nil
-	}
-	return e.IPMetadata
-}
-
-func setCachedIPMeta(p Proxy, network string, meta *x.IPMetadata) {
-	pid := p.ID()
-	key := pid + "/" + network + "/" + p.GetAddr()
-	until := maxIpmetaLifetime
-	if local(pid) {
-		// local proxies' dialerhandle never recreate (on network changes)
-		// and so, we are aggressive for how long we'll cache their responses
-		until = minIpmetaLifetime
-	}
-	ipm.K(key, &ipmeta{p.DialerHandle(), meta}, until)
-}
 
 type proxyClient struct {
 	p Proxy
@@ -123,244 +68,31 @@ func (c *proxyClient) IP6() (*x.IPMetadata, error) {
 }
 
 func fetchIPMetadata(p Proxy, network string) (*x.IPMetadata, error) {
-	if cached := getCachedIPMeta(p, network); cached != nil {
-		return cached, nil
-	}
-
-	st := p.Status()
-	if st != TOK && st != TKO {
-		return nil, errNotActive
-	}
-
-	rt := p.Router()
-	// "tcp" and "udp" are dual-stack
-	is4 := network == "tcp4" || network == "udp4" || network == "ip4"
-	is6 := network == "tcp6" || network == "udp6" || network == "ip6"
-	is46 := network == "tcp" || network == "udp" || network == "ip"
-	if !rt.IP4() && is4 {
-		return nil, errProxyRoute
-	}
-	if !rt.IP6() && is6 {
-		return nil, errProxyRoute
-	}
-	if !rt.IP4() && !rt.IP6() && is46 {
-		return nil, errProxyRoute
-	}
-
 	meta := &x.IPMetadata{ID: idstr(p)}
 	mullvadURL := mullvadV4URL
 	if network == "tcp6" {
 		mullvadURL = mullvadV6URL
 	}
 
-	if ipi, err0 := fetchIPinfo(p, network); err0 == nil {
-		applyIPinfo(meta, ipi)
-		meta.ProviderURL = ipinfoURL
-	} else if ws, err1 := fetchWindscribe(p, network); err1 == nil {
-		applyWindscribe(meta, ws)
-		meta.ProviderURL = wsGeoURL
-	} else if trace, err2 := fetchTrace(p, network); err2 == nil {
+	if trace, err1 := fetchTrace(p, network); err1 == nil {
 		applyTrace(meta, trace)
 		meta.ProviderURL = traceURL
-	} else if warp, err3 := fetchWarp(p, network); err3 == nil {
+	} else if warp, err2 := fetchWarp(p, network); err2 == nil {
 		applyWarp(meta, warp)
 		meta.ProviderURL = warpURL
-	} else if mull, err4 := fetchMullvad(p, network, mullvadURL); err4 == nil {
+	} else if mull, err3 := fetchMullvad(p, network, mullvadURL); err3 == nil {
 		applyMullvad(meta, mull)
 		meta.ProviderURL = mullvadURL
 	} else {
-		perr := fmt.Errorf("proxy: client: %s %s lookup failed", idstr(p), network)
-		return nil, core.JoinErr(perr, err0, err1, err2, err3, err4)
+		perr := fmt.Errorf("proxy: client: %s ip lookup failed", idstr(p))
+		return nil, core.JoinErr(perr, err1, err2, err3)
 	}
 
 	if len(meta.IP) <= 0 {
-		return nil, fmt.Errorf("proxy: client: %s %s lookup failed", idstr(p), network)
+		return nil, fmt.Errorf("proxy: client: %s ip lookup failed", idstr(p))
 	}
 
-	setCachedIPMeta(p, network, meta)
 	return meta, nil
-}
-
-// fakeBearer generates a fake Windscribe-shaped Bearer token.
-// Format: <9-digit-id>:1:<unix-epoch>:<42-hex-sig1>:<42-hex-sig2>
-func fakeBearer(change bool) string {
-	if change || len(globalWsFakeBearer) == 0 {
-		maxID := big.NewInt(900000000)
-		n, err := rand.Int(rand.Reader, maxID)
-		if err != nil {
-			n = big.NewInt(21102401) // fallback
-		}
-		id := n.Int64() + 100000000 // ensure 9 digits
-
-		sig := func() string {
-			b := make([]byte, 21) // 21 bytes → 42 hex chars
-			rand.Read(b)          //nolint:errcheck
-			return hex.EncodeToString(b)
-		}
-
-		globalWsFakeBearer = fmt.Sprintf("%d:1:%d:%s:%s", id, time.Now().Unix(), sig(), sig())
-	}
-	return globalWsFakeBearer
-}
-
-//	{
-//		"data": {
-//			"geo": {
-//				"ip": "14.139.180.67",
-//				"country_name": "India",
-//				"country_code": "IN",
-//				"city_name": "Coimbatore",
-//				"isp": "NKN Core Network",
-//				"lat": "11.01020",
-//				"long": "76.97010"
-//			}
-//		}
-//	}
-type wsGeoInner struct {
-	IP          string `json:"ip"`
-	CountryCode string `json:"country_code"`
-	CityName    string `json:"city_name"`
-	ISP         string `json:"isp"`
-	Lat         string `json:"lat"`
-	Long        string `json:"long"`
-}
-
-type wsResp struct {
-	Data struct {
-		Geo wsGeoInner `json:"geo"`
-	} `json:"data"`
-	ErrorCode int `json:"errorCode"`
-}
-
-func fetchWindscribe(p Proxy, network string) (*wsGeoInner, error) {
-	if skipWsForTesting {
-		return nil, errors.New("testing: windscribe skipped")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), maxHttpTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wsGeoURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+fakeBearer(false))
-	req.Header.Set("Origin", "https://windscribe.net")
-	req.Header.Set("Referer", "https://windscribe.net")
-
-	log.VV("proxy: client: %s fetching windscribe via %s...", idstr(p), network)
-
-	client := httpClient(p, network, maxHttpTimeout)
-	resp, err := client.Do(req)
-	if resp == nil {
-		return nil, core.OneErr(err, errors.New("proxy: client: windscribe nil response"))
-	}
-	defer core.Close(resp.Body)
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		defer fakeBearer(true)
-		return nil, fmt.Errorf("proxy: client: windscribe status %s / err? %v", resp.Status, err)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxIPBodySize))
-	if err != nil {
-		return nil, err
-	}
-
-	var ws wsResp
-	if err := json.Unmarshal(data, &ws); err != nil {
-		return nil, err
-	}
-	if ws.ErrorCode != 0 {
-		return nil, fmt.Errorf("proxy: client: windscribe error %d", ws.ErrorCode)
-	}
-	if ws.Data.Geo.IP == "" {
-		return nil, errors.New("proxy: client: empty windscribe response")
-	}
-
-	return &ws.Data.Geo, nil
-}
-
-func applyWindscribe(meta *x.IPMetadata, geo *wsGeoInner) {
-	if geo.IP != "" {
-		meta.IP = geo.IP
-	}
-	if geo.CountryCode != "" {
-		meta.CC = strings.ToUpper(geo.CountryCode)
-	}
-	if geo.CityName != "" {
-		meta.City = geo.CityName
-	}
-	if geo.ISP != "" {
-		meta.ASNOrg = geo.ISP
-	}
-	if lat, err := strconv.ParseFloat(strings.TrimSpace(geo.Lat), 64); err == nil {
-		meta.Lat = lat
-	}
-	if lon, err := strconv.ParseFloat(strings.TrimSpace(geo.Long), 64); err == nil {
-		meta.Lon = lon
-	}
-}
-
-//	{
-//		"ip": "14.139.180.67",
-//		"asn": "AS55824",
-//		"as_name": "NKN Core Network",
-//		"as_domain": "nkn.gov.in",
-//		"country_code": "IN",
-//		"country": "India",
-//		"continent_code": "AS",
-//		"continent": "Asia"
-//	}
-type ipinfoResp struct {
-	IP          string `json:"ip"`
-	ASN         string `json:"asn"`
-	ASName      string `json:"as_name"`
-	ASDomain    string `json:"as_domain"`
-	CountryCode string `json:"country_code"`
-}
-
-func fetchIPinfo(p Proxy, network string) (*ipinfoResp, error) {
-	if skipIPinfoForTesting {
-		return nil, errors.New("testing: ipinfo skipped")
-	}
-
-	body, err := fetch(p, network, ipinfoURL)
-	if err != nil {
-		return nil, err
-	}
-
-	var resp ipinfoResp
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-
-	if resp.IP == "" {
-		return nil, errors.New("proxy: client: empty ipinfo response")
-	}
-
-	return &resp, nil
-}
-
-func applyIPinfo(meta *x.IPMetadata, resp *ipinfoResp) {
-	if resp.IP != "" {
-		meta.IP = resp.IP
-	}
-	if resp.ASN != "" {
-		meta.ASN = resp.ASN
-	}
-	if resp.ASName != "" {
-		meta.ASNOrg = resp.ASName
-	}
-	if resp.ASDomain != "" {
-		meta.ASNDom = resp.ASDomain
-	}
-	if resp.CountryCode != "" {
-		meta.CC = strings.ToUpper(resp.CountryCode)
-	}
 }
 
 // fetchTrace fetches the Cloudflare trace data via the given proxy.
@@ -532,8 +264,7 @@ func applyMullvad(meta *x.IPMetadata, resp *mullvadResp) {
 		meta.IP = resp.IP
 	}
 	if resp.Country != "" && meta.CC == "" {
-		// TODO: resp.Country isn't country code
-		// meta.CC = resp.Country
+		meta.CC = resp.Country
 	}
 	if resp.City != "" {
 		meta.City = resp.City
@@ -550,7 +281,12 @@ func applyMullvad(meta *x.IPMetadata, resp *mullvadResp) {
 }
 
 func fetch(p Proxy, network, rawurl string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), maxHttpTimeout)
+	parsed, err := url.Parse(rawurl)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
@@ -561,7 +297,7 @@ func fetch(p Proxy, network, rawurl string) ([]byte, error) {
 	log.VV("proxy: client: %s fetching %s via %s...", idstr(p), rawurl, network)
 
 	// TODO: pool clients
-	client := httpClient(p, network, maxHttpTimeout)
+	client := httpClient(p, network, parsed)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -585,59 +321,43 @@ func fetch(p Proxy, network, rawurl string) ([]byte, error) {
 	return data, nil
 }
 
-// Exported for testing only.
-func HttpClient(p Proxy, network string, timeout time.Duration) *http.Client {
-	return httpClient(p, network, timeout)
-}
-
-func httpClient(p Proxy, network string, httpTimeout time.Duration) *http.Client {
+func httpClient(p Proxy, network string, u *url.URL) *http.Client {
 	return &http.Client{
 		Timeout: httpTimeout,
 		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 				host, port, err := net.SplitHostPort(addr)
 				if err != nil {
 					host = addr
 				}
 
 				if port == "" {
-					return nil, log.EE("proxy: client: no port in %q", addr)
-				}
-
-				on, err := strconv.Atoi(port)
-				if err != nil || on <= 0 {
-					return nil, log.EE("proxy: client: invalid port %q in %q", port, addr)
-				}
-
-				// use preferred when proxy does not have dns
-				dnsid := x.Preferred
-				if hasDNS := len(p.DNS()) > 0; hasDNS {
-					dnsid = p.ID()
-				}
-
-				ips, err := dialers.Resolve(host, dnsid)
-				if err != nil {
-					if dnsid != x.Default && settings.DefaultDNSAsFallback.Load() {
-						log.D("proxy: client: %s on %s resolve %s err %s: %v; using Default",
-							idstr(p), network, dnsid, host, err)
-						ips = dialers.For(host)
-					} else {
-						err = log.EE("proxy: client: %s on %s resolve %s err %s: %v",
-							idstr(p), network, dnsid, host, err)
-						return nil, err
+					switch {
+					case u.Port() != "":
+						port = u.Port()
+					case u.Scheme == "https":
+						port = "443"
+					default:
+						port = "80"
 					}
 				}
 
-				if len(ips) <= 0 {
-					return nil, errMissingAddress
+				on, _ := strconv.Atoi(port)
+				if on <= 0 {
+					if u.Scheme == "https" {
+						on = 443
+					} else {
+						on = 80
+					}
 				}
 
+				ips := dialers.For(host)
 				filtered := make([]netip.Addr, 0, len(ips))
 				for _, ip := range ips {
-					if (network == "udp" || network == "udp6" || network == "tcp" || network == "tcp4") && ip.Is4() {
+					if network == "tcp4" && ip.Is4() {
 						filtered = append(filtered, ip)
 					}
-					if (network == "udp" || network == "udp6" || network == "tcp" || network == "tcp6") && ip.Is6() {
+					if network == "tcp6" && ip.Is6() {
 						filtered = append(filtered, ip)
 					}
 				}
@@ -646,27 +366,24 @@ func httpClient(p Proxy, network string, httpTimeout time.Duration) *http.Client
 					return nil, errNoSuitableAddress
 				}
 
-				if log.Verbose {
-					log.V("proxy: client: %s resolved %s to %v on port %d for %s",
-						idstr(p), host, filtered, on, network)
-				}
+				log.VV("proxy: client: %s resolved %s to %v on port %d for %s", idstr(p), host, filtered, on, network)
 
 				var lastErr error
 				for _, ip := range filtered {
 					dest := netip.AddrPortFrom(ip, uint16(on)).String()
-
-					// TODO: p.DialContext(ctx ...)
-					// dial via specified proxy
-					conn, err := p.Dial(network, dest)
-					if err != nil {
-						lastErr = log.EE("proxy: client: %s failed to dial %s @ %s on %s: %v", idstr(p), host, dest, network, err)
-						continue
+					if conn, err := p.Dial(network, dest); err == nil {
+						log.VV("proxy: client: %s dialed %s @ %s on %s", idstr(p), host, dest, network)
+						return conn, nil
+					} else {
+						log.E("proxy: client: %s failed to dial %s @ %s on %s: %v", idstr(p), host, dest, network, err)
+						lastErr = err
 					}
-					log.I("proxy: client: %s dialed %s @ %s on %s", idstr(p), host, dest, network)
-					return conn, nil
 				}
 
-				return nil, core.OneErr(lastErr, core.ErrNoFruitOfLabour)
+				if lastErr == nil {
+					lastErr = errNoSuitableAddress
+				}
+				return nil, lastErr
 			},
 			TLSHandshakeTimeout:   httpTimeout / 2,
 			ResponseHeaderTimeout: httpTimeout - 2,
@@ -683,5 +400,6 @@ func (h *auto) Client() x.Client    { return newProxyClient(h) }
 func (h *socks5) Client() x.Client  { return newProxyClient(h) }
 func (h *http1) Client() x.Client   { return newProxyClient(h) }
 func (h *wgproxy) Client() x.Client { return newProxyClient(h) }
+func (h *seproxy) Client() x.Client { return newProxyClient(h) }
 func (h *pipws) Client() x.Client   { return newProxyClient(h) }
 func (h *piph2) Client() x.Client   { return newProxyClient(h) }

@@ -21,7 +21,6 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
-	"slices"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -143,7 +142,7 @@ func Net2ProxyID(network string) (proto string, pids []string) {
 func BustAndroidCacheIfNeeded(ans *dns.Msg) bool {
 	if BustDnsproxydResNetCache && !IsDNSSECAnswerAuthenticated(ans) {
 		// TODO: skip negative records (SOA, NXDOMAIN, etc)
-		return WithTtl(ans, ZeroTTL, dns.TypeA, dns.TypeAAAA, dns.TypeSVCB, dns.TypeHTTPS, dns.TypeCNAME)
+		return WithTtl(ans, ZeroTTL, dns.TypeA, dns.TypeAAAA)
 	}
 	return false
 }
@@ -198,7 +197,13 @@ func FindUnique(s []string, n []string) (u []string) {
 	}
 
 	for _, e := range n {
-		uniq := !slices.Contains(s, e)
+		uniq := true
+		for _, x := range s {
+			if e == x {
+				uniq = false
+				break
+			}
+		}
 		if uniq {
 			u = append(u, e)
 		}
@@ -247,8 +252,8 @@ func GetBlocklistStampFromURL(rawurl string) (string, error) {
 		return "", errors.New("no path")
 	}
 	s := strings.TrimLeft(u.Path, "/")
-	found := strings.Contains(s, ":") // stamps with ":" are versioned
-	if !found {
+	i := strings.Index(s, ":") // stamps with ":" are versioned
+	if i == -1 {
 		return url.QueryEscape(s), nil
 	} else { // versioned stamps use path-escape
 		return url.PathEscape(s), nil

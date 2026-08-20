@@ -5,6 +5,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //go:build ignore
+// +build ignore
 
 // cyclic imports
 
@@ -42,7 +43,11 @@ func (r fakeResolver) Lookup([]byte) ([]byte, error) {
 	return nil, errors.New("not implemented")
 }
 
-func (r fakeResolver) LookupNetIP(ctx context.Context, network, host, uid string, tids ...string) ([]netip.Addr, error) {
+func (r fakeResolver) LookupOn([]byte, ...string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupNetIPFor(ctx context.Context, network, host, uid string) ([]netip.Addr, error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -68,7 +73,7 @@ type fakeBdg struct {
 }
 
 var (
-	baseNsOpts = &x.DNSOpts{IPCSV: "", TIDCSV: x.CT + "test0"}
+	baseNsOpts = &x.DNSOpts{PIDCSV: dnsx.NetNoProxy, IPCSV: "", TIDCSV: x.CT + "test0"}
 	baseTab    = &rnet.Tab{CID: "testcid", Block: false}
 )
 
@@ -114,8 +119,7 @@ func TestDot(t *testing.T) {
 	dtr, _ := dns53.NewTransport(ctx, x.Default, "1.1.1.1", "53", pxr)
 	tr, _ := dns53.NewTransport(ctx, "test0", "1.0.0.2", "53", pxr)
 
-	natpt := x64.NewNatPt2(ctx)
-	natpt.Kickstart(netr)
+	natpt := x64.NewNatPt(tm, bdg)
 	resolv := dnsx.NewResolver(ctx, "10.111.222.3:53", tm, dtr, bdg, natpt)
 	resolv.Add(tr)
 	r4, _, err := resolv.Forward(b4)
@@ -141,6 +145,47 @@ func TestDot(t *testing.T) {
 	log.Output(10, xdns.Ans(ans6))
 }
 
+func TestSEProxy(t *testing.T) {
+	netr := &fakeResolver{}
+	ctx := context.TODO()
+	ctl := &fakeCtl{}
+	obs := &fakeObs{}
+	bdg := &fakeBdg{Controller: ctl}
+	pxr := NewProxifier(ctx, ctl, obs)
+	ilog.SetLevel(0)
+	settings.Debug = true
+	dialers.Mapper(netr)
+
+	_ = xdns.NetAndProxyID("tcp", Base)
+	tm := settings.NewTunMode(
+		settings.DNSModePort,
+		settings.BlockModeNone,
+		settings.PtModeAuto,
+	)
+
+	tr, _ := dns53.NewTLSTransport(ctx, "test0", "1.1.1.1", nil, pxr)
+	dtr, _ := dns53.NewTransport(ctx, x.Default, "1.1.1.1", "53", pxr)
+
+	natpt := x64.NewNatPt(tm, bdg)
+	resolv := dnsx.NewResolver(ctx, "10.111.222.3", tm, dtr, bdg, natpt)
+	resolv.Add(tr)
+
+	if err := pxr.RegisterSE(); err != nil {
+		t.Fatal(err)
+	}
+	if ips, err := pxr.TestSE(); err != nil {
+		t.Fatal(err)
+	} else {
+		ilog.D("se: %v", ips)
+	}
+
+	se, _ := pxr.ProxyFor(RpnSE)
+	if ok := Reaches(se, "google.com", "tcp"); !ok {
+		t.Fail()
+	}
+	t.Log("proxy reaches")
+}
+
 func TestProxyReaches(t *testing.T) {
 	netr := &fakeResolver{}
 	ctx := context.TODO()
@@ -162,14 +207,13 @@ func TestProxyReaches(t *testing.T) {
 	tr, _ := dns53.NewTLSTransport(ctx, "test0", "1.1.1.1", nil, pxr)
 	dtr, _ := dns53.NewTransport(ctx, x.Default, "1.1.1.1", "53", pxr)
 
-	natpt := x64.NewNatPt2(ctx)
-	natpt.Kickstart(netr)
+	natpt := x64.NewNatPt(tm, bdg)
 	resolv := dnsx.NewResolver(ctx, "10.111.222.3", tm, dtr, bdg, natpt)
 	resolv.Add(tr)
 
 	var projson []byte
 	var err error
-	if projson, err = pxr.RegisterWin(nil, nil, "", nil); err != nil {
+	if projson, err = pxr.RegisterWin(nil); err != nil {
 		t.Fatal(err)
 	}
 	if ips, err := pxr.TestWin(); err != nil {
@@ -208,8 +252,7 @@ func TestWindscribeReaches(t *testing.T) {
 	tr, _ := dns53.NewTLSTransport(ctx, "test0", "1.1.1.1", nil, pxr)
 	dtr, _ := dns53.NewTransport(ctx, x.Default, "1.1.1.1", "53", pxr)
 
-	natpt := x64.NewNatPt2(ctx)
-	natpt.Kickstart(netr)
+	natpt := x64.NewNatPt(tm, bdg)
 	resolv := dnsx.NewResolver(ctx, "10.111.222.3", tm, dtr, bdg, natpt)
 	resolv.Add(tr)
 

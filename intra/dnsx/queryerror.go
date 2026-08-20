@@ -22,12 +22,11 @@ const (
 	TransportError = x.TransportError
 	ClientError    = x.ClientError
 	Paused         = x.Paused
-	Unpaused       = x.Unpaused
 	DEnd           = x.DEnd
-	Unknown        = x.Unknown
+	Unknown        = 100
 )
 
-func Status2Str(status int32) string {
+func Status2Str(status int) string {
 	switch status {
 	case Start:
 		return "Starting"
@@ -51,8 +50,6 @@ func Status2Str(status int32) string {
 		return "End"
 	case Paused:
 		return "Paused"
-	case Unpaused:
-		return "Unpaused"
 	default:
 		return "Unknown" // 100
 	}
@@ -61,7 +58,7 @@ func Status2Str(status int32) string {
 var errNop = errors.New("no error")
 
 type QueryError struct {
-	status int32
+	status int
 	err    error
 }
 
@@ -79,7 +76,7 @@ func (e *QueryError) Unwrap() error {
 	return e.err // may be nil and that's how it should be
 }
 
-func (e *QueryError) Status() int32 {
+func (e *QueryError) Status() int {
 	if e == nil {
 		return Unknown // unknown
 	}
@@ -100,7 +97,7 @@ func (e *QueryError) String() string {
 	return e.strstatus() + ":" + e.Error()
 }
 
-func newQueryError(no int32, err error) *QueryError {
+func newQueryError(no int, err error) *QueryError {
 	return &QueryError{no, err} // err may be nil
 }
 

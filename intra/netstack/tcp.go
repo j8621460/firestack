@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/celzero/firestack/intra/core"
@@ -29,13 +28,6 @@ import (
 const rcvwnd = 0
 
 const maxInFlight = 512 // arbitrary
-
-// tcpFwdWatchdog is the max time a forwarder request may stay "in-flight"
-// (uncompleted) before it is aborted (RST) to free up its slot. A stalled
-// handler goroutine that never completes its ForwarderRequest leaks an
-// in-flight slot; once maxInFlight slots are leaked, gvisor silently drops all
-// new SYNs (ForwardMaxInFlightDrop) and egress TCP stalls with no error.
-const tcpFwdWatchdog = 60 * time.Second
 
 // retry connect when early connect (done when no happy eyeballs) fails?
 const retryLateConnect = false
@@ -60,15 +52,11 @@ var _ core.TCPConn = (*GTCPConn)(nil)
 type GTCPConn struct {
 	o     string // owner
 	stack *stack.Stack
-	c     atomic.Pointer[gonet.TCPConn] // conn exposes TCP semantics atop endpoint
-	src   netip.AddrPort                // local addr (remote addr in netstack)
-	dst   netip.AddrPort                // remote addr (local addr in netstack)
-	req   *tcp.ForwarderRequest         // egress request as a TCP state machine
+	c     *core.Volatile[*gonet.TCPConn] // conn exposes TCP semantics atop endpoint
+	src   netip.AddrPort                 // local addr (remote addr in netstack)
+	dst   netip.AddrPort                 // remote addr (local addr in netstack)
+	req   *tcp.ForwarderRequest          // egress request as a TCP state machine
 	once  sync.Once
-	// watchdog, when armed, aborts (RST) the request if it is not completed
-	// within tcpFwdWatchdog, freeing the forwarder's in-flight slot. Stopped
-	// in complete(); safe to leave unset for non-forwarder conns.
-	watchdog *time.Timer
 }
 
 // s is the netstack to use for dialing (reads/writes).
@@ -84,7 +72,7 @@ func InboundTCP(who string, s *stack.Stack, in net.Conn, to, from netip.AddrPort
 	if !settings.HappyEyeballs.Load() {
 		open, err := newgc.tryConnect()
 
-		if log.Debug {
+		if settings.Debug {
 			logeif(err)("ns: tcp: %s: inbound: tryConnect err src(%v) => dst(%v); open? %t / retry? %t, err(%v)",
 				newgc.o, to, from, open, retryLateConnect, err)
 		}
@@ -103,11 +91,11 @@ func InboundTCP(who string, s *stack.Stack, in net.Conn, to, from netip.AddrPort
 
 // OutboundTCP sets up a TCP forwarder h to handle TCP packets.
 // If h is nil, s uses the (built-in) default TCP forwarding logic.
-func OutboundTCP(who string, s *stack.Stack, h GTCPConnHandler) {
-	if fwd := tcpForwarder(who, s, h); fwd != nil {
+func OutboundTCP(id string, s *stack.Stack, h GTCPConnHandler) {
+	if fwd := tcpForwarder(id, s, h); fwd != nil {
 		s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 	} else { // unset
-		log.I("ns: tcp: %s: forwarder: nil handler; unsetting forwarder...", who)
+		log.I("ns: tcp: %s: forwarder: nil handler; unsetting forwarder...", id)
 		s.SetTransportProtocolHandler(tcp.ProtocolNumber, nil)
 	}
 }
@@ -135,25 +123,12 @@ func tcpForwarder(who string, s *stack.Stack, h GTCPConnHandler) *tcp.Forwarder 
 		// ref: github.com/google/gvisor/blob/be6ffa7/pkg/tcpip/stack/transport_demuxer.go#L180
 		gtcp := makeGTCPConn(who, s, req, src, dst)
 
-		// arm an abort watchdog: gvisor frees the forwarder's in-flight slot
-		// only when ForwarderRequest.Complete is called; if the handler
-		// goroutine below stalls before establishing/completing the request
-		// (onFlow, dials, etc.), the slot leaks and, once maxInFlight slots
-		// are leaked, all new SYNs are silently dropped. Abort() completes the
-		// request (RST) so the app retries; a late Establish/complete by the
-		// handler is a no-op (sync.Once).
-		gtcp.watchdog = time.AfterFunc(tcpFwdWatchdog, func() {
-			log.W("ns: tcp: %s: forwarder: watchdog: aborting stale req src(%v) => dst(%v)",
-				who, src, dst)
-			gtcp.Abort()
-		})
-
 		// setup endpoint right away, so that netstack's internal state is consistent
 		// in case there are multiple forwarders dispatching from the TUN device.
 		if !settings.HappyEyeballs.Load() { // syn-ack before delivering to handler?
 			opened, err := gtcp.tryConnect()
 
-			if log.Debug {
+			if settings.Debug {
 				logeif(err)("ns: tcp: %s: forwarder: tryConnect err src(%v) => dst(%v); open? %t, err(%v)",
 					who, src, dst, opened, err)
 			}
@@ -161,13 +136,6 @@ func tcpForwarder(who string, s *stack.Stack, h GTCPConnHandler) *tcp.Forwarder 
 			if !retryLateConnect && (err != nil || !opened) {
 				h.Error(gtcp, src, dst, core.OneErr(err, errMissingEp)) // error
 			} else { // gtcp may be connected
-				if opened {
-					// endpoint is established (passive handshake done) and the
-					// conn is independent of the request; free the in-flight
-					// slot right away so that stalls in the handler (onFlow,
-					// dials) cannot leak slots (see watchdog above).
-					gtcp.complete(false)
-				}
 				h.Proxy(gtcp, src, dst)
 			}
 		} else {
@@ -183,6 +151,7 @@ func makeGTCPConn(who string, s *stack.Stack, req *tcp.ForwarderRequest, src, ds
 	return &GTCPConn{
 		o:     who,
 		stack: s,
+		c:     core.NewZeroVolatile[*gonet.TCPConn](),
 		src:   src,
 		dst:   dst,
 		req:   req, // may be nil
@@ -216,9 +185,6 @@ func (g *GTCPConn) tryConnect() (open bool, err error) {
 // maxInFlight and may cause silent tcp conn drops.
 func (g *GTCPConn) complete(rst bool) {
 	g.once.Do(func() {
-		if g.watchdog != nil {
-			g.watchdog.Stop() // request is done; disarm the abort timer
-		}
 		req := g.req
 		log.D("ns: tcp: %s: forwarder: complete src(%v) => dst(%v); req? %t, rst? %t",
 			g.o, g.LocalAddr(), g.RemoteAddr(), req != nil, rst)
@@ -234,17 +200,10 @@ func (g *GTCPConn) synack(complete bool) (rst bool, err error) {
 	}
 
 	defer func() {
-		if rst {
-			// always complete on error: free the forwarder's in-flight slot
-			// (keyed by the 5-tuple) and send RST so the app's TCP stack
-			// doesn't keep this half-open, stale, or conflicting on retry.
-			g.complete(true)
-		} else if complete {
-			// complete when g is opened and caller requested completion.
-			g.complete(false)
+		// complete when either g is opened or complete is set
+		if complete || !rst {
+			g.complete(rst)
 		}
-		// when rst=false and complete=false, leave the request open
-		// for the caller to complete later (e.g. happy-eyeballs).
 	}()
 
 	if g.req != nil { // egressing (process netstack's req from tun)
@@ -263,7 +222,7 @@ func (g *GTCPConn) synack(complete bool) (rst bool, err error) {
 			g.c.Store(conn)
 		}
 	} else { // ingressing (process a conn into tun)
-		if log.Verbose {
+		if settings.Debug {
 			log.V("ns: tcp: %s: dial: (inbound) creating endpoint for %v => %v", g.o, g.LocalAddr(), g.RemoteAddr())
 		}
 		src, proto := addrport2nsaddr(g.dst) // remote addr is local addr in netstack

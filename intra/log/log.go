@@ -37,7 +37,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 )
 
 // based on: github.com/eycorsican/go-tun2socks/blob/301549c43/common/log/log.go#L5
@@ -58,12 +57,6 @@ type Console interface {
 	Log(level LogLevel, msg Logmsg)
 }
 
-// MemReader is the consumer side of a Memconsole double-buffer.
-type MemReader interface {
-	Drain(fd, start, end int) int
-	OnClose() bool
-}
-
 type FilebasedConsole interface {
 	Console
 	io.Closer
@@ -71,9 +64,8 @@ type FilebasedConsole interface {
 }
 
 type conMsg struct {
-	m  []Logmsg  // one or more formatted log lines
-	ml []*[]byte // pooled slabs backing m; recycled after dispatch
-	t  LogLevel
+	m Logmsg
+	t LogLevel
 }
 
 type LogFn func(string, ...any)
@@ -82,7 +74,6 @@ type LogFn2 func(int, string, ...any)
 func init() {
 	Glogger.SetLevel(INFO)
 	Glogger.SetConsoleLevel(STACKTRACE)
-	Glogger.SetCallerDepth(maxCallerDepth)
 }
 
 func SetLevel(level LogLevel) {
@@ -93,16 +84,8 @@ func SetConsoleLevel(level LogLevel) {
 	Glogger.SetConsoleLevel(level)
 }
 
-func SetCallerDepth(d uint8) {
-	Glogger.SetCallerDepth(d)
-}
-
 func ConsoleReady(ctx context.Context) {
 	Glogger.ConsoleReady(ctx)
-}
-
-func StackOutput(w io.Writer) bool {
-	return Glogger.StackOutput(w)
 }
 
 // SetConsole sets external console to redirect log output to.
@@ -205,11 +188,6 @@ func Wtf(msg string, args ...any) {
 	Glogger.Fatalf(callerat, msg, args...)
 }
 
-func S(alleast64k []byte) []byte {
-	n := runtime.Stack(alleast64k, true)
-	return alleast64k[:n]
-}
-
 // C logs the stack trace of the current goroutine to Console.
 func C(msg string, scratch []byte) {
 	E2(callerat, "----START----")
@@ -269,18 +247,6 @@ func W2(at int, msg string, args ...any) {
 
 func E2(at int, msg string, args ...any) {
 	Glogger.Errorf(at+nextframe, msg, args...)
-}
-
-func Metrics() string {
-	if m := Glogger.Metrics(); m != nil {
-		return m.String()
-	}
-	return "<no logmet>"
-}
-
-// Hist writes the recents to w, one line per entry.
-func Hist(w io.Writer) int {
-	return Glogger.Hist(w)
 }
 
 func LevelOf(level int32) LogLevel {

@@ -7,27 +7,27 @@
 // This file incorporates work covered by the following copyright and
 // permission notice:
 //
-//	  MIT License
+//	MIT License
 //
-//	  Copyright (c) 2018 eycorsican
+//	Copyright (c) 2018 eycorsican
 //
-//	  Permission is hereby granted, free of charge, to any person obtaining a copy
-//	  of this software and associated documentation files (the "Software"), to deal
-//	  in the Software without restriction, including without limitation the rights
-//	  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-//	  copies of the Software, and to permit persons to whom the Software is
-//	  furnished to do so, subject to the following conditions:
+//	Permission is hereby granted, free of charge, to any person obtaining a copy
+//	of this software and associated documentation files (the "Software"), to deal
+//	in the Software without restriction, including without limitation the rights
+//	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//	copies of the Software, and to permit persons to whom the Software is
+//	furnished to do so, subject to the following conditions:
 //
-//	  The above copyright notice and this permission notice shall be included in all
-//	  copies or substantial portions of the Software.
+//	The above copyright notice and this permission notice shall be included in all
+//	copies or substantial portions of the Software.
 //
-//	  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//	  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//	  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-//	  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//	  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-//	  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-//	  SOFTWARE.
+//	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//	SOFTWARE.
 
 package log
 
@@ -35,25 +35,20 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"io"
 	golog "log"
 	"os"
 	"reflect"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 )
 
-// originally: github.com/eycorsican/go-tun2socks/blob/301549c43/common/log/simple/logger.go
-
 type Logger interface {
 	SetLevel(level LogLevel)
 	SetConsoleLevel(level LogLevel)
 	SetConsole(c Console)
-	SetCallerDepth(d uint8)
 	ConsoleReady(ctx context.Context)
 	Usr(msg string)
 	Printf(msg string, args ...any)
@@ -67,17 +62,13 @@ type Logger interface {
 	Fatalf(at int, msg string, args ...any)
 	Trace(c bool, t string)
 	Stack(at int, msg string, scratch []byte)
-	StackOutput(w io.Writer) bool
-	Hist(w io.Writer) int
-	Metrics() *LogStat
 }
 
+// based on github.com/eycorsican/go-tun2socks/blob/301549c43/common/log/simple/logger.go
 type simpleLogger struct {
 	tag string
 
 	level LogLevel // golog (internal log) level
-
-	callerdepth uint8 // total frames to dig per log call
 
 	c      atom[Console]
 	clevel LogLevel      // may be different from level
@@ -89,40 +80,41 @@ type simpleLogger struct {
 
 	o *golog.Logger
 	e *golog.Logger
-	s atom[io.Writer] // stack trace output
-	x *xlog           // may be used instead of golog o/e
-	q *ring[*[]byte]  // ring buffer of pooled []byte slabs
+	q *ring[string] // todo: use []byte instead of string for gc?
 
 	clock
 	skips
-
-	// per-level counters (updated atomically in writelog)
-	ncount [NONE + 1]atomic.Uint64 // total messages logged
-	nbytes [NONE + 1]atomic.Uint64 // total bytes formatted
 }
 
-type atom[T any] struct {
-	v atomic.Value
-}
-
-type wrappedAtomValue[T any] struct{ v T }
+type atom[T any] atomic.Value
 
 func (a *atom[T]) get() (zz T) {
 	if a == nil {
 		return
 	}
-	if x := a.v.Load(); x != nil {
-		return x.(wrappedAtomValue[T]).v
+	aa := (*atomic.Value)(a)
+	if t, ok := aa.Load().(T); ok {
+		return t
 	}
-	return
+	return zz
 }
 
-func (a *atom[T]) set(t T) bool {
+func (a *atom[T]) set(t T) (ok bool) {
 	if a == nil {
-		return false
+		return
 	}
-	a.v.Store(wrappedAtomValue[T]{t})
-	return true
+	if isNil(t) {
+		zz := &atom[T]{}
+		*a = *zz
+		return
+	}
+	old := a.get()
+	if !typeEq(old, t) {
+		r := &atom[T]{}
+		*a = *r
+	}
+	aa := (*atomic.Value)(a)
+	return aa.CompareAndSwap(old, t)
 }
 
 const pcbuckets = 512
@@ -153,11 +145,6 @@ func (a *uatom[T]) cas(old, new T) bool {
 	aa := (*atomic.Uint32)(a)
 	return aa.CompareAndSwap(uint32(old), uint32(new))
 }
-
-const (
-	maxCallerDepth = 9
-	minCallerDepth = 0
-)
 
 var _ Logger = (*simpleLogger)(nil)
 
@@ -200,6 +187,8 @@ func (l LogLevel) s() string {
 	}
 }
 
+const consoleStacktraceSep = "\n<===>\n"
+
 const defaultLevel = INFO
 const defaultClevel = STACKTRACE
 
@@ -221,7 +210,7 @@ const qSize = 512
 const minQSize = 16
 
 // consoleChSize is the size of the console channel.
-const consoleChSize = 2048
+const consoleChSize = 512
 
 // minBytesForFullStacktrace is the size needed for a full stacktrace.
 const minBytesForFullStacktrace = 16 << 10 // 16KB
@@ -235,9 +224,6 @@ const similarUsrMsgThreshold = 3
 // charsPerLine is max no. of characters per log line.
 // less than 1024: github.com/golang/mobile/blob/2553ed8ce2/internal/mobileinit/mobileinit_android.go#L52
 const charsPerLine = 800
-
-// prependTrace if true, prepends trace information to log msg; appends, otherwise.
-const prependTrace = false
 
 // spamMsgThreshold is the min. no. of spammy msgs to report.
 var spammsgThreshold = [NONE + 1]uint32{
@@ -257,9 +243,6 @@ const callerunknown = "?c?"
 
 const defaultFlags = 0 // no flags
 
-var Debug = false
-var Verbose = false
-
 func defaultLogger() *simpleLogger {
 	l := &simpleLogger{
 		level:   defaultLevel,
@@ -270,16 +253,12 @@ func defaultLogger() *simpleLogger {
 		// github.com/golang/mobile/blob/fa72addaaa/internal/mobileinit/mobileinit_android.go#L74-L92
 		e: golog.New(os.Stderr, "", defaultFlags),
 		o: golog.New(os.Stdout, "", defaultFlags),
-		x: &xlog{}, // pipes output to logcat on Android, to fmt.Print otherwise
-		q: newRing(context.TODO(), qSize, recycle),
-	}
-	if runtime.GOOS == "android" {
-		golog.SetOutput(l.x)
+		q: newRing[string](context.TODO(), qSize),
 	}
 	return l
 }
 
-// NewLogger creates a new Logger with the given tag.
+// NewLogger creates a new Glogger with the given tag.
 func NewLogger(tag string) *simpleLogger {
 	l := defaultLogger()
 	if len(tag) <= 0 { // if tag is empty, leave it as is
@@ -297,22 +276,12 @@ func NewLogger(tag string) *simpleLogger {
 // SetLevel sets the log level.
 func (l *simpleLogger) SetLevel(n LogLevel) {
 	l.level = n
-
-	Debug = (l.level <= DEBUG || l.clevel <= DEBUG)
-	Verbose = Debug && (l.level <= VERBOSE || l.clevel <= VERBOSE)
 }
 
 // SetLevel sets the log level.
 func (l *simpleLogger) SetConsoleLevel(n LogLevel) {
 	l.clearStCounts()
 	l.clevel = n
-	Debug = (l.level <= DEBUG || l.clevel <= DEBUG)
-	Verbose = Debug && (l.level <= VERBOSE || l.clevel <= VERBOSE)
-}
-
-// SetCallerDepth sets total frames to unearth for every log fn call.
-func (l *simpleLogger) SetCallerDepth(d uint8) {
-	l.callerdepth = min(max(d, minCallerDepth), maxCallerDepth)
 }
 
 // SetConsole sets the external log console.
@@ -348,7 +317,7 @@ func (l *simpleLogger) incrStCount(id string) (c uint32) {
 	if len(id) > 500 {
 		id = id[:500]
 	}
-	loc := fhash(unsafe.Slice(unsafe.StringData(id), len(id)))
+	loc := fhash([]byte(id))
 	c = l.stcount[loc]
 	l.stcount[loc]++
 	return c
@@ -367,51 +336,34 @@ func (l *simpleLogger) consoleDispatcher(ctx context.Context) {
 		if m == nil || len(m.m) <= 0 { // no msg
 			continue
 		}
-		load := (len(l.cmsgC) * 100) / cap(l.cmsgC) // load percentage
+		load := (len(l.cmsgC) / cap(l.cmsgC) * 100) // load percentage
 		if c := l.c.get(); c != nil && !isNil(c) {  // look for l.c on every msg
 			switch m.t {
 			case NONE:
 				// drop
 			case VVERBOSE, VERBOSE, DEBUG, INFO:
-				if load < 95 {
-					for _, line := range m.m {
-						c.Log(m.t, line)
-					}
-					recycleAll(m.ml)
+				if load < 50 {
+					c.Log(m.t, m.m)
 					continue
 				} // drop
 			case WARN, ERROR:
 				if load < 5 {
 					if d := l.cskips.Swap(0); d > 0 {
-						bp, bpsl := l.fmtmsg(WARN, "backpressure... dropped %d msgs", d)
-						for _, line := range bp {
-							c.Log(WARN, line)
-						}
-						recycleAll(bpsl)
+						c.Log(WARN, Logmsg(l.msgstr(WARN, "backpressure... dropped %d msgs", d)))
 					}
 				}
-				if load < 99 {
-					for _, line := range m.m {
-						c.Log(m.t, line)
-					}
-					recycleAll(m.ml)
+				if load < 80 {
+					c.Log(m.t, m.m)
 					continue
 				} // drop
 			case STACKTRACE:
-				for _, line := range m.m {
-					c.Log(m.t, line)
-				}
-				recycleAll(m.ml)
+				c.Log(m.t, m.m)
 				continue
 			case USR:
-				for _, line := range m.m {
-					c.Log(m.t, line)
-				}
-				recycleAll(m.ml)
+				c.Log(m.t, m.m)
 				continue
 			}
 		} // dropped
-		recycleAll(m.ml)
 		l.cskips.Add(1)
 	}
 }
@@ -420,8 +372,7 @@ func (l *simpleLogger) consoleDispatcher(ctx context.Context) {
 func (l *simpleLogger) consoleQueue(m *conMsg) {
 	select {
 	case l.cmsgC <- m:
-	default:
-		recycleAll(m.ml) // channel full; recycle slabs
+	default: // drop
 	}
 }
 
@@ -430,7 +381,7 @@ func (l *simpleLogger) Usr(msg string) {
 		if count := l.incrStCount(msg); count > similarUsrMsgThreshold {
 			return
 		}
-		l.consoleQueue(&conMsg{m: []Logmsg{(Logmsg)(msg)}, t: USR})
+		l.consoleQueue(&conMsg{Logmsg(msg), USR})
 	}
 }
 
@@ -471,11 +422,7 @@ func (l *simpleLogger) Errorf(at int, msg string, args ...any) {
 
 func (l *simpleLogger) Fatalf(at int, msg string, args ...any) {
 	// todo: log to console?
-	msgs, slabs := l.fmtmsg(STACKTRACE, msg, args...)
-	for _, line := range msgs {
-		l.err(at+nextframe, line)
-	}
-	recycleAll(slabs)
+	l.err(at+nextframe, l.msgstr(STACKTRACE, msg, args...))
 	os.Exit(1)
 }
 
@@ -485,8 +432,6 @@ func (l *simpleLogger) Fatalf(at int, msg string, args ...any) {
 func (l *simpleLogger) emitStack(at int, msgs ...string) {
 	sendtoconsole := at <= callerat
 	c := l.c.get()
-	s := l.s.get()
-	hass := s != nil && !isNil(s)
 	hasc := c != nil && !isNil(c)
 
 	for _, msg := range msgs {
@@ -495,17 +440,11 @@ func (l *simpleLogger) emitStack(at int, msgs ...string) {
 		}
 		if !sendtoconsole {
 			l.err(at+nextframe, msg)
-		} else if hass {
-			// send stacktrace to stackoutput if set
-			// some Console impls, like MemConsole struggle
-			// with handling stacktraces (due to bugs / timing)
-			b := unsafe.Slice(unsafe.StringData(msg), len(msg))
-			s.Write(b)
 		} else if hasc {
 			// c.Stack() on the same go routine, since
 			// the caller (ex: core.Recover) may exit
 			// immediately once simpleLogger.Stack() returns
-			c.Log(STACKTRACE, (Logmsg)(msg))
+			c.Log(STACKTRACE, Logmsg(msg))
 		} else {
 			// msg, which is unsafely type-coerced from []byte,
 			// is pooled; but the caller owns []byte and so it
@@ -543,7 +482,7 @@ func (l *simpleLogger) Stack(at int, msg string, scratch []byte) {
 	}
 
 	count := l.incrStCount(msg)
-	msg = msg + " (#" + strconv.FormatUint(uint64(count), 10) + ")"
+	msg = msg + fmt.Sprintf(" (#%d)", count)
 	if count > similarTraceThreshold {
 		l.emitStack(at, msg, "stacktrace suppressed")
 		return
@@ -561,7 +500,7 @@ func (l *simpleLogger) Stack(at int, msg string, scratch []byte) {
 
 	// byt2str accepted proposal: github.com/golang/go/issues/19367
 	// previous discussion: github.com/golang/go/issues/25484
-	trace := unsafe.String(unsafe.SliceData(scratch), n)
+	trace := unsafe.String(&scratch[0], n)
 	l.emitStack(at, msg, trace, prev)
 }
 
@@ -573,173 +512,61 @@ func (l *simpleLogger) queued(all bool) (appendix string) {
 	i := 0
 	// todo: interned strings github.com/golang/go/issues/62483
 	lines := make([]string, maxlines)
-	for _, a := range l.q.All() {
-		if a != nil && len(*a) > 0 {
-			// yolo: possible 'a' points to a recycled byte
-			lines[i] = unsafe.String(unsafe.SliceData(*a), len(*a))
-			i++
-		}
+	for recent := range l.q.Iter() {
+		lines[i] = recent
+		i++
 		if i >= len(lines) {
 			break
 		}
 	}
 	if i > 0 {
-		// strings.Join creates a new str
 		appendix = strings.Join(lines[:i], "\n")
 	}
 	return
 }
 
-func (l *simpleLogger) fmtmsg(lvl LogLevel, f string, args ...any) ([]Logmsg, []*[]byte) {
-	return l.fmtmsg2(lvl, "", f, args...)
-}
-
-func (l *simpleLogger) fmtmsg2(lvl LogLevel, t, f string, args ...any) (msgs []Logmsg, slabs []*[]byte) {
+func (l *simpleLogger) msgstr(lvl LogLevel, f string, args ...any) (msg string) {
 	level := lvl.s()
-	tag := l.tag
 
 	if len(f) <= 0 {
-		s := level + tag + "<empty>"
-		return []Logmsg{s}, nil
+		return level + l.tag + "<empty>"
 	}
-	defer func() {
-		// update per-level counters
-		l.ncount[lvl].Add(uint64(len(msgs)))
-		for _, line := range msgs {
-			l.nbytes[lvl].Add(uint64(len(line)))
-		}
-	}()
-
-	if len(args) > 0 {
-		f = fmt.Sprintf(f, args...) // excl tag+level
-	} // else: fast path: no format args, single slab pass
-	tlen := 0
-	if len(t) > 0 {
-		tlen = len(t) + 1 // +1 for the '\t' separator
+	if len(args) <= 0 {
+		return level + l.tag + f
 	}
-	if len(f)+tlen < charsPerLine-len(level)-len(tag) {
-		n := len(level) + len(tag) + len(f) + tlen
-		ptr := obtain(n)
-		buf := (*ptr)[:n]
-		off := 0
-		copy(buf[off:], level)
-		off += len(level)
-		copy(buf[off:], tag)
-		off += len(tag)
-		if len(t) > 0 {
-			if prependTrace {
-				copy(buf[off:], t)
-				off += len(t)
-				buf[off] = '\t'
-				off++
-				copy(buf[off:], f)
-			} else {
-				copy(buf[off:], f)
-				off += len(f)
-				buf[off] = '\t'
-				off++
-				copy(buf[off:], t)
-			}
-		} else {
-			copy(buf[off:], f)
-		}
-		*ptr = buf
-		return []Logmsg{b2msg(buf)}, []*[]byte{ptr}
-	}
-	return l.splitlines(lvl, t, f)
-}
-
-func (l *simpleLogger) splitlines(lvl LogLevel, t, f string) ([]Logmsg, []*[]byte) {
-	level := lvl.s()
-	tag := l.tag
-	prefix := len(level) + len(tag)
-	chunk := max(charsPerLine-prefix, 1)
-
-	// join trace and message body
-	var msg string
-	if prependTrace {
-		if len(t) > 0 {
-			msg = t + "\t" + f
-		} else {
-			msg = f
-		}
-	} else {
-		if len(t) > 0 {
-			msg = f + "\t" + t
-		} else {
-			msg = f
-		}
+	msg = fmt.Sprintf(f, args...)
+	if len(msg) <= charsPerLine { // excl tag+level
+		return level + l.tag + msg
 	}
 
-	// estimate number of output lines
-	est := (len(msg)+chunk-1)/chunk + strings.Count(msg, "\n")
-	msgs := make([]Logmsg, 0, est)
-	slabs := make([]*[]byte, 0, est)
-
-	// will iterate once on msg if "\n" is not present: go.dev/play/p/_fNaqiDll2A
-	for line := range strings.SplitSeq(msg, "\n") {
-		if len(line) == 0 { // skip empty segments (trailing/consecutive \n)
-			continue
+	var s strings.Builder
+	for i := 0; i < len(msg); i += charsPerLine {
+		if i > 0 {
+			s.WriteByte('\n')
 		}
-		for i := 0; i < len(line); i += chunk {
-			seg := line[i:min(i+chunk, len(line))]
-			n := prefix + len(seg)
-			ptr := obtain(n)
-			buf := (*ptr)[:n]
-			copy(buf, level)
-			copy(buf[len(level):], tag)
-			copy(buf[prefix:], seg)
-			*ptr = buf
-			msgs = append(msgs, b2msg(buf))
-			slabs = append(slabs, ptr)
+		s.WriteString(level)
+		if len(l.tag) > 0 {
+			s.WriteString(l.tag)
 		}
+		end := min(i+charsPerLine, len(msg))
+		s.WriteString(msg[i:end])
 	}
-	return msgs, slabs
+	return s.String()
 }
 
 // out logs to stdout and pushes msg into ring buffer.
 // ref: github.com/golang/mobile/blob/c713f31d/internal/mobileinit/mobileinit_android.go#L51
 func (l *simpleLogger) out(msg string) {
-	if runtime.GOOS == "android" {
-		l.x.Write(unsafe.Slice(unsafe.StringData(msg), len(msg)))
-	} else {
-		_ = l.o.Output(0 /*not used*/, msg) // may error
-	}
-}
-
-// push splits msg on newlines and pushes each non-empty line into the
-// ring buffer individually. Since charsPerLine=800, each line fits in a
-// LB1024 slab, so the pool never allocates oversized slabs.
-func (l *simpleLogger) push(msg string) {
-	// TODO? push from where split already happens rather than doing again
-	// TODO: slog
-	// will iterate at least once
-	for line := range strings.SplitSeq(msg, "\n") {
-		if len(line) <= 0 {
-			continue
-		}
-		ptr := obtain(len(line))
-		buf := (*ptr)[:len(line)]
-		copy(buf, line)
-		*ptr = buf
-		if !l.q.Push(ptr) {
-			recycle(ptr) // ring dropped it; return slab to pool
-		}
-	}
+	_ = l.o.Output(0 /*not used*/, msg) // may error
+	l.q.Push(msg)
 }
 
 // err logs to stderr and pushes msg into ring buffer.
 func (l *simpleLogger) err(at int, msg string) {
-	if l.callerdepth > 0 {
-		_, file := caller(at + nextframe)
-		msg = file + msg
-	}
-	if runtime.GOOS == "android" {
-		l.x.Write(unsafe.Slice(unsafe.StringData(msg), len(msg)))
-	} else {
-		_ = l.e.Output(0 /*unused*/, msg) // may error
-	}
-	l.push(msg)
+	_, file := caller(at + nextframe)
+	msg = file + msg
+	_ = l.e.Output(0 /*unused*/, msg) // may error
+	l.q.Push(msg)
 }
 
 func caller(at int) (pc uintptr, who string) {
@@ -751,21 +578,15 @@ func caller2(at int, sep1, sep2 string) (pc uintptr, who string) {
 	if len(file) <= 0 {
 		file = fileunknown
 	} else {
-		file = shortfile(file) + sep1 + strconv.Itoa(line) + sep2
+		file = shortfile(file) + sep1 + fmt.Sprint(line) + sep2
 	}
 	return pc, file
 }
 
-var nopcs = []uintptr{0}
-var nofiles = []string{fileunknown}
-
 // go.dev/play/p/h9Woqcp0Xz0
-// go traceback is expensive:
-// blog.felixge.de/reducing-gos-execution-tracer-overhead-with-frame-pointer-unwinding/
-// go.dev/blog/execution-traces-2024
 func callers(at, until int, sep1, sep2 string) (pcs []uintptr, files []string, skipped int) {
 	if until <= 0 {
-		return nopcs, nofiles, 0
+		return []uintptr{0}, []string{fileunknown}, 0
 	} else if until == 1 {
 		pc, who := caller2(at+nextframe, sep1, "")
 		return []uintptr{pc}, []string{who}, 0
@@ -774,47 +595,41 @@ func callers(at, until int, sep1, sep2 string) (pcs []uintptr, files []string, s
 	rpc := make([]uintptr, until)
 	n := runtime.Callers(at+nextframe, rpc)
 	if n < 1 {
-		return nopcs, nofiles, until
+		return []uintptr{0}, []string{fileunknown}, until
 	}
 
 	pcs = make([]uintptr, 0, until)
 	files = make([]string, 0, until)
-	frames := runtime.CallersFrames(rpc[:n])
+	frames := runtime.CallersFrames(rpc)
 	for i := range until {
 		frame, more := frames.Next()
 		pc := frame.PC // may be 0
 		file := frame.File
 		line := frame.Line
 		fn := frame.Function
-		if len(file) <= 0 { // more is false when file is empty
-			file = fileunknown
-		} else {
-			file = shortfile(file) + sep1 + strconv.Itoa(line)
-		}
 		if len(fn) <= 0 {
 			fn = callerunknown
 		} else {
 			// ex: fn = "github.com/celzero/firestack/intra/dnsx.ChooseHealthyProxyHostPort"
 			fn = shortfile(fn)
-			fn = shortfn(fn)
 		}
-
-		file += sep2 + fn
+		if len(file) <= 0 { // more is false when file is empty
+			file = fileunknown
+		} else {
+			file = shortfile(file) + sep1 + fmt.Sprint(line) + sep2 + fn
+		}
 		pcs = append(pcs, pc)
 		files = append(files, file)
-		if !more {
-			skipped = until - (i + 1)
+		if !more || file == fileunknown || fn == callerunknown {
 			break
 		}
+		skipped = until - i
 	}
 	return
 }
 
 func tracecaller(s string) bool {
-	if len(s) <= 0 || s == fileunknown || s == callerunknown {
-		return false
-	}
-	if strings.HasSuffix(s, callerunknown) && strings.HasPrefix(s, fileunknown) {
+	if len(s) <= 0 || s == callerunknown || s == fileunknown {
 		return false
 	}
 	// ex: asm_arm64.s:1223>async.go:49>async.go:121>proxy.go:789
@@ -824,47 +639,6 @@ func tracecaller(s string) bool {
 	return true
 }
 
-// b2msg creates a Logmsg from a byte slice without copying.
-// github.com/golang/go/issues/19367
-func b2msg(b []byte) Logmsg {
-	if len(b) <= 0 {
-		return ""
-	}
-	return (Logmsg)(unsafe.String(unsafe.SliceData(b), len(b)))
-}
-
-// splitmsg parses the two-character level prefix prepended by msgstr
-// ("D ", "I ", "W ", "E ") and returns the corresponding LogLevel
-// together with the message with that prefix stripped.
-// If the prefix is not recognised, INFO and the original slice are returned.
-func splitmsg(p []byte) (LogLevel, Logmsg) {
-	if len(p) >= 2 && p[1] == ' ' {
-		switch p[0] {
-		case 'Y':
-			return VVERBOSE, b2msg(p[2:])
-		case 'V':
-			return VERBOSE, b2msg(p[2:])
-		case 'D':
-			return DEBUG, b2msg(p[2:])
-		case 'I':
-			return INFO, b2msg(p[2:])
-		case 'W':
-			return WARN, b2msg(p[2:])
-		case 'E':
-			return ERROR, b2msg(p[2:])
-		case 'F':
-			return STACKTRACE, b2msg(p[2:])
-		case 'U':
-			return USR, b2msg(p[2:])
-		case ' ':
-			return NONE, "" // drop
-		default: // may be "?"
-		}
-	}
-	return INFO, b2msg(p)
-}
-
-// shortfile strips the last path component from a file path.
 func shortfile(file string) string {
 	if i := strings.LastIndexByte(file, '/'); i >= 0 {
 		file = file[i+1:]
@@ -872,134 +646,78 @@ func shortfile(file string) string {
 	return file
 }
 
-// shortfn strips the package and receiver type from a fully-qualified
-// function name, keeping only the function name itself.
-// ex: "ipn.(*proxifier).RegisterWin" >> "RegisterWin"
-// ex: "rpn.makeWsWg" >> "makeWsWg"
-func shortfn(fn string) string {
-	if i := strings.LastIndexByte(fn, '.'); i >= 0 {
-		fn = fn[i+1:]
-	}
-	return fn
-}
-
 func (l *simpleLogger) writelog(lvl LogLevel, at int, msg string, args ...any) {
 	ll := l.level <= lvl
 	cc := l.clevel <= lvl
 
-	if ll || cc {
-		var pc uintptr
-		var file1 string
-		if l.callerdepth == maxCallerDepth {
-			pc, file1 = caller(at + nextframe)
-		} else {
-			// skip expensive runtime.Caller; fast-hash up to first 12 chars of msg
-			n := min(len(msg), 12)
-			file1 = msg[:n]
-			pc = uintptr(fhash(unsafe.Slice(unsafe.StringData(msg), n)))
-		}
-		var trace strings.Builder
+	pc, file1 := caller(at + nextframe)
+	trace := ""
 
-		isspam := l.spammy(lvl, pc)
-		if isspam {
-			l.skips[lvl].Add(1)
-		}
+	isspam := l.spammy(lvl, pc)
+	if isspam {
+		l.skips[lvl].Add(1)
+	}
 
-		if n := l.skips[lvl].Load(); n > spammsgThreshold[lvl] {
-			swapped := l.skips[lvl].CompareAndSwap(n, 0)
-			if swapped && (cc || ll) {
-				spammsgs, spamslabs := l.fmtmsg(lvl, "spammy..."+file1+" %d msgs; dropped? %t", n, !spamConsole)
-				if ll {
-					for _, line := range spammsgs {
-						l.out(line)
-					}
-				}
-				// print spammsg only if spamming is not allowed
-				if cc && !spamConsole {
-					l.consoleQueue(&conMsg{m: spammsgs, ml: spamslabs, t: lvl})
-				} else {
-					recycleAll(spamslabs)
-				}
+	if n := l.skips[lvl].Load(); n > spammsgThreshold[lvl] {
+		swapped := l.skips[lvl].CompareAndSwap(n, 0)
+		if swapped && (cc || ll) {
+			spammsg := l.msgstr(lvl, file1+"spammy... %d msgs; dropped? %t", n, !spamConsole)
+			if ll {
+				l.out(spammsg)
+			}
+			// print spammsg only if spamming is not allowed
+			if cc && !spamConsole {
+				l.consoleQueue(&conMsg{Logmsg(spammsg), lvl})
 			}
 		}
+	}
 
-		// ex: go_backendmain.go:6895@_cgoexp_d123334b966f_proxybackend_Rpn_RegisterWin
-		// > go_backendmain.go:7120@main.proxybackend_Rpn_RegisterWin
-		// > proxies.go:1271@ipn.(*proxifier).RegisterWin
-		// > proxies.go:1296@ipn.(*proxifier).registerWin
-		// > yegor.go:1868@rpn.(*BaseClient).MakeWsWgFrom
-		// > yegor.go:1790@rpn.(*BaseClient).MakeWsWg
-		// > yegor.go:1809@rpn.makeWsWg
-		// > yegor.go:1602@rpn.genWgConfs
-		_, x, _ := callers(at+nextframe, int(l.callerdepth), ":", "@")
-
-		hasAtleastOneTracedCaller := tracecaller(x[0])
-
+	if ll || cc {
+		_, x, _ := callers(at+nextframe, 7, ":", "@")
 		switch lvl {
 		case USR, STACKTRACE, NONE: // no-op
 		case VVERBOSE:
-			if len(x) >= 10 && tracecaller(x[9]) {
-				trace.WriteString(x[9])
-				trace.WriteByte('>')
+			if len(x) >= 7 && tracecaller(x[6]) {
+				trace += x[6] + ">"
 			}
 			fallthrough
 		case VERBOSE:
-			if len(x) >= 9 && tracecaller(x[8]) {
-				trace.WriteString(x[8])
-				trace.WriteByte('>')
+			if len(x) >= 6 && tracecaller(x[5]) {
+				trace += x[5] + ">"
 			}
 			fallthrough
 		case DEBUG, ERROR, WARN, INFO:
-			if len(x) >= 8 && tracecaller(x[7]) {
-				trace.WriteString(x[7])
-				trace.WriteByte('>')
-			}
-			if len(x) >= 7 && tracecaller(x[6]) {
-				trace.WriteString(x[6])
-				trace.WriteByte('>')
-			}
-			if len(x) >= 6 && tracecaller(x[5]) {
-				trace.WriteString(x[5])
-				trace.WriteByte('>')
-			}
 			if len(x) >= 5 && tracecaller(x[4]) {
-				trace.WriteString(x[4])
-				trace.WriteByte('>')
+				trace += x[4] + ">"
 			}
 			// err
 			if len(x) >= 4 && tracecaller(x[3]) {
-				trace.WriteString(x[3])
-				trace.WriteByte('>')
+				trace += x[3] + ">"
 			}
 			// warn
 			if len(x) >= 3 && tracecaller(x[2]) {
-				trace.WriteString(x[2])
-				trace.WriteByte('>')
+				trace += x[2] + ">"
 			}
 			// info
 			if len(x) >= 2 && tracecaller(x[1]) {
-				trace.WriteString(x[1])
-				trace.WriteByte('>')
+				trace += x[1] + ">"
 			}
 			fallthrough
 		default:
-			if hasAtleastOneTracedCaller { // x[0] == file1 without fn info
-				trace.WriteString(x[0])
+			if tracecaller(file1) { // same as x[0]
+				trace += file1
+			}
+			if len(trace) > 0 {
+				trace += ": " // end-of-trace marker
 			}
 		}
-
-		msgs, slabs := l.fmtmsg2(lvl, trace.String(), msg, args...)
-
+		msg = l.msgstr(lvl, trace+msg, args...)
 		if ll {
 			// go's internal logger grabs mutex before every write
-			for _, line := range msgs {
-				l.out(line)
-			}
+			l.out(msg)
 		}
 		if cc && (!isspam || spamConsole) {
-			l.consoleQueue(&conMsg{m: msgs, ml: slabs, t: lvl})
-		} else {
-			recycleAll(slabs)
+			l.consoleQueue(&conMsg{Logmsg(msg), lvl})
 		}
 	}
 }
@@ -1018,6 +736,12 @@ top:
 	// go.dev/play/p/QgqEdE7KIAZ
 	bkt := pc % pcbuckets
 
+	defer func() {
+		if !y { // age bkt when not spammy
+			(l.clock.l2[lvl][bkt]).inc()
+		}
+	}()
+
 	v := (l.clock.l2[lvl][bkt]).v()
 
 	// reset if pc clock (l2) out ticks level clock (l1);
@@ -1027,15 +751,13 @@ top:
 	if v > t {
 		resyncd := (l.clock.l2[lvl][bkt]).cas(t, 0) // set to t/2?
 		if resyncd {
-			// age bkt when not spammy
-			(l.clock.l2[lvl][bkt]).inc()
 			return false // not spammy
 		} // else: someone else won the race
 		resyncAttempts++
 		if resyncAttempts <= 3 {
 			goto top
 		} // else: so many calls that atomic updates won't go through
-		// TODO? assume spammy as that's most likely to be the case
+		// assume spammy as that's most likely to be the case
 		return false
 	}
 
@@ -1051,11 +773,7 @@ top:
 	} else { // for upto 256 ticks
 		tt = tt * 30 / 100 // allow upto 30% of ticks
 	}
-	y = uint16(v) > tt
-	if !y { // age bkt when not spammy
-		(l.clock.l2[lvl][bkt]).inc()
-	}
-	return
+	return uint16(v) > tt
 }
 
 // Cannot import pkg core here.
@@ -1074,49 +792,12 @@ func isNil(x any) bool {
 	return false
 }
 
-// Metrics returns current logger and pool statistics as a formatted string.
-func (l *simpleLogger) Metrics() *LogStat {
-	s := l.logstat()
-	return &s
-}
-
-func (l *simpleLogger) StackOutput(w io.Writer) bool {
-	return l.s.set(w)
-}
-
-// Hist writes items from recents q to w, one per line.
-func (l *simpleLogger) Hist(w io.Writer) (n int) {
-	for _, ptr := range l.q.All() {
-		if ptr != nil {
-			if sz := len(*ptr); sz > 0 {
-				w.Write(*ptr)
-				w.Write([]byte{'\n'})
-				n += sz
-			}
-		}
+// from: intra/core/typ.go:typeEq
+func typeEq(a, b any) bool {
+	if isNil(a) {
+		return false
+	} else if isNil(b) {
+		return false
 	}
-	return
-}
-
-// logstat snapshots the current logger state into a LogStat struct.
-func (l *simpleLogger) logstat() LogStat {
-	s := LogStat{
-		Tag:          l.tag,
-		Level:        l.level,
-		ConsoleLevel: l.clevel,
-		CallerDepth:  l.callerdepth,
-		ConsoleDrops: l.cskips.Load(),
-		RingSize:     l.q.Len(),
-	}
-
-	for i := LogLevel(0); i <= NONE; i++ {
-		s.Count[i] = l.ncount[i].Load()
-		s.Bytes[i] = l.nbytes[i].Load()
-		s.Skipped[i] = l.skips[i].Load()
-		s.ClockL1[i] = (l.clock.l1[i]).v()
-	}
-
-	s.PoolGets, s.PoolNews, s.PoolPuts, s.PoolDrops = logpoolStats()
-
-	return s
+	return reflect.TypeOf(a) == reflect.TypeOf(b)
 }

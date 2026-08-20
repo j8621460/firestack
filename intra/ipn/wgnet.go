@@ -65,7 +65,7 @@ func (tnet *wgtun) LookupContextHost(ctx context.Context, host string) ([]netip.
 	}
 
 	// dialers.Resolve returns from cache (which may be stale)
-	if ips, err := dialers.Resolve(host, tnet.ID()); len(ips) <= 0 {
+	if ips, err := dialers.Resolve(host, tnet.ID().V()); len(ips) <= 0 {
 		if err == nil {
 			err = errNoSuchHost
 		}
@@ -80,8 +80,8 @@ func (tnet *wgtun) LookupContextHost(ctx context.Context, host string) ([]netip.
 // generic dialer
 // --------------------------------------------------------------------
 
-func (tnet *wgtun) DialContext(ctx context.Context, network, local, remote string) (net.Conn, error) {
-	return tnet.dial(ctx, network, local, remote)
+func (tnet *wgtun) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return tnet.dial(ctx, network, "", address)
 }
 
 func (tnet *wgtun) dial(ctx context.Context, network, local, remote string) (net.Conn, error) {

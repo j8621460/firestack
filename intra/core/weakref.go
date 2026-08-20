@@ -14,21 +14,19 @@ import (
 
 var errNoCreat = errors.New("weak: create fn nil")
 
-type vfactory[V any] func() (new *V)
-type vtest[V any] func(*V) (ok bool)
+type reffactory[V any] func() *V
+type reftest[V any] func(*V) bool
 
 func refpass[V any](_ *V) bool { return true }
 
 type WeakRef[V any] struct {
 	mu    sync.RWMutex
 	weak  weak.Pointer[V]
-	creat vfactory[V]
-	test  vtest[V]
+	creat reffactory[V]
+	test  reftest[V]
 }
 
-// refs to pointers to interfaces: go.dev/play/p/QWjdHVrg_84
-// unsafe type conversion: github.com/golang/go/issues/71583
-func NewWeakRef[V any](creat vfactory[V], test vtest[V]) (*WeakRef[V], error) {
+func NewWeakRef[V any](creat reffactory[V], test reftest[V]) (*WeakRef[V], error) {
 	if creat == nil {
 		return nil, errNoCreat
 	}
@@ -70,15 +68,9 @@ func (w *WeakRef[V]) loadOrStore() (v *V, valid bool) {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !valid { // create new v
-		v = w.storeLocked()
-		return
-	}
-
-	v = w.weak.Value() // cur v?
-	if v == nil {      // no v, gc won
+	if v = w.weak.Value(); v == nil { // gc won
 		v = w.storeLocked() // new v
-	} // else: use cur v
+	} // else: use existing v
 	return
 }
 

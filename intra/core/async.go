@@ -9,31 +9,16 @@ package core
 import (
 	"context"
 	"errors"
-	"fmt"
 	"runtime/debug"
 	"strconv"
 	"time"
 )
 
-// ActiveWorkers returns a snapshot of all goroutines currently running
-// inside async.go helpers (Go, Gx, Gg, Grx, etc.).
-func ActiveWorkers() []WorkersState {
-	var out []WorkersState
-	workmap.Range(func(k, v any) bool {
-		e := v.(roent)
-		out = append(out, WorkersState{Typ: e.typ, ID: k.(string), Since: time.Since(e.dob)})
-		return true
-	})
-	return out
-}
-
 // Go runs f in a goroutine and recovers from any panics.
-func Go(who string, f Finally) {
+func Go(who string, f func()) {
 	go func() {
 		debug.SetPanicOnFault(true)
 		defer Recover(DontExit, who)
-		untrack := trackwork(who, "go")
-		defer untrack()
 
 		f()
 	}()
@@ -44,8 +29,6 @@ func Go1[T any](who string, f func(T), arg T) {
 	go func() {
 		debug.SetPanicOnFault(true)
 		defer Recover(DontExit, who)
-		untrack := trackwork(who, "go1")
-		defer untrack()
 
 		f(arg)
 	}()
@@ -56,8 +39,6 @@ func Go2[T0 any, T1 any](who string, f func(T0, T1), a0 T0, a1 T1) {
 	go func() {
 		debug.SetPanicOnFault(true)
 		defer Recover(DontExit, who)
-		untrack := trackwork(who, "go2")
-		defer untrack()
 
 		f(a0, a1)
 	}()
@@ -65,24 +46,20 @@ func Go2[T0 any, T1 any](who string, f func(T0, T1), a0 T0, a1 T1) {
 
 // Gg runs f in a goroutine, recovers from any panics if any;
 // then calls cb in a separate goroutine, and recovers from any panics.
-func Gg(who string, f Callback, cb Finally) {
+func Gg(who string, f func(), cb func()) {
 	go func() {
 		debug.SetPanicOnFault(true)
 		defer RecoverFn(who, cb)
-		untrack := trackwork(who, "gg")
-		defer untrack()
 
 		f()
 	}()
 }
 
 // Gx runs f in a goroutine and exits the process if f panics.
-func Gx(who string, f Callback) {
+func Gx(who string, f func()) {
 	go func() {
 		debug.SetPanicOnFault(true)
 		defer Recover(Exit11, who)
-		untrack := trackwork(who, "gx")
-		defer untrack()
 
 		f()
 	}()
@@ -93,15 +70,13 @@ func Gx1[T any](who string, f func(T), arg T) {
 	go func() {
 		debug.SetPanicOnFault(true)
 		defer Recover(Exit11, who)
-		untrack := trackwork(who, "gx1")
-		defer untrack()
 
 		f(arg)
 	}()
 }
 
 // Gif runs f in a goroutine if cond is true.
-func Gif(cond bool, who string, f Callback) {
+func Gif(cond bool, who string, f func()) {
 	if cond {
 		Go(who, f)
 	}
@@ -117,16 +92,11 @@ func Grx[T any](who string, f WorkCtx[T], d time.Duration) (zz T, completed bool
 	// go.dev/play/p/VtWYJrxhXz6
 	go func() {
 		debug.SetPanicOnFault(true)
-		untrack := trackwork(who, "grx")
-		defer untrack()
-		func() {
-			defer Recover(DontExit, who)
-			out, _ := f(ctx) // TODO: log error?
-			select {
-			case <-ctx.Done():
-			case ch <- out:
-			}
-		}()
+		defer Recover(Exit11, who)
+		defer close(ch)
+
+		out, _ := f(ctx) // TODO: log error?
+		ch <- out
 	}()
 
 	select {
@@ -137,48 +107,11 @@ func Grx[T any](who string, f WorkCtx[T], d time.Duration) (zz T, completed bool
 	return zz, false
 }
 
-// Gre runs work function f in a goroutine, blocking until it returns or ctx is done.
-func Gre[T any](who string, f Work[T], ctx context.Context) (zz T, err error, completed bool) {
-	type res struct {
-		t   T
-		err error
-	}
-	ch := make(chan *res, 1) // non-blocking
-
-	// go.dev/play/p/VtWYJrxhXz6
-	go func() {
-		debug.SetPanicOnFault(true)
-		untrack := trackwork(who, "grx2")
-		defer untrack()
-		func() {
-			defer Recover(DontExit, who)
-			defer close(ch)
-			t, e := f()
-			select {
-			case <-ctx.Done():
-			case ch <- &res{t, e}:
-			}
-		}()
-	}()
-
-	select {
-	case out := <-ch:
-		if out == nil {
-			return zz, errPanic(who), false
-		}
-		return out.t, out.err, true
-	case <-ctx.Done(): // timeout or cancellation
-		return zz, ctx.Err(), false
-	}
-}
-
 // Gxe runs f in a goroutine, ignores returned error, and exits on panics.
 func Gxe(who string, f func() error) {
 	go func() {
 		debug.SetPanicOnFault(true)
 		defer Recover(Exit11, who)
-		untrack := trackwork(who, "gxe")
-		defer untrack()
 
 		_ = f()
 	}()
@@ -186,10 +119,8 @@ func Gxe(who string, f func() error) {
 
 // errPanic returns an error indicating that the function at index i panicked.
 func errPanic(who string) error {
-	return fmt.Errorf("%w: %s fn panicked", errPanicked, who)
+	return errors.New(who + " fn panicked")
 }
-
-var errPanicked = errors.New("async: function panicked")
 
 // Race runs all the functions in fs concurrently and returns the first non-error result.
 // Returned values are the result, the index of the function that returned the result, and any errors.
@@ -211,6 +142,7 @@ func Race[T any](who string, timeout time.Duration, fs ...WorkCtx[T]) (zz T, fid
 	defer cancel()
 
 	for i, f := range fs {
+		i, f := i, f
 		fid := who + ".race." + strconv.Itoa(i)
 		Gg(fid, func() {
 			out, err := f(ctx)
@@ -246,12 +178,12 @@ loop:
 	return // zz
 }
 
-func First[T any](who string, overallTimeout time.Duration, tester func(T) bool, fs ...WorkCtx[T]) (zz T, idx int) {
+func First[T any](who string, overallTimeout time.Duration, fs ...WorkCtx[T]) (zz T, idx int) {
 	timeoutPerFn := overallTimeout / time.Duration(len(fs))
 	for i, f := range fs {
 		// unneeded in go1.23+ i, f := i, f
 		fid := who + ".all." + strconv.Itoa(i)
-		if x, ok := Grx(fid, f, timeoutPerFn); ok && tester(x) {
+		if x, ok := Grx(fid, f, timeoutPerFn); ok {
 			return x, i
 		}
 	}
@@ -361,7 +293,7 @@ func Await1[T any](f func() T, until time.Duration) (v T, gotV bool) {
 
 func EitherOr(either <-chan struct{}, or Callback, until time.Duration) (esc bool) {
 	select {
-	case <-time.After(until):
+	case <-time.Tick(until):
 		if or != nil {
 			or()
 		}

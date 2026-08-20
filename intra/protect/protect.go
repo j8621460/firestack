@@ -27,8 +27,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"os"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,11 +36,11 @@ import (
 	"github.com/celzero/firestack/intra/log"
 )
 
-// See: ipmap.LookupNetIP; Selfhost -> dnsx.Default; Systemhost -> dnsx.System
+// See: ipmap.LookupNetIP; UidSelf -> dnsx.Default; UidSystem -> dnsx.System
 const (
-	Selfhost   = b.Selfhost
-	Systemhost = b.Systemhost
-	Localhost  = b.Localhost
+	UidSelf   = b.UidSelf
+	UidSystem = b.UidSystem
+	Localhost = b.Localhost
 
 	// hostless is a special placeholder prefix for dns53 transport that
 	// has multiple IP:port addresses and is "protected" (never resolved nor
@@ -52,16 +50,11 @@ const (
 	// When advertised routes are actually null routed (no reply)
 	// this timeout will help short circuit dial attempts on it.
 	defaultConnectTimeout = 10 * time.Second
-
-	// if true, only protects the socket from routing loops & binds to active network.
-	onlyProtectWildcardAddrs = false
 )
-
-var MyUid = strconv.Itoa(os.Getuid())
 
 // never resolve system/default/"hostless" resolver; expected to have seeded ips
 func NeverResolve(hostname string) bool {
-	return hostname == Selfhost || hostname == Systemhost || strings.HasPrefix(hostname, HostlessPrefix)
+	return hostname == UidSelf || hostname == UidSystem || strings.HasPrefix(hostname, HostlessPrefix)
 }
 
 type Controller = b.Controller
@@ -86,7 +79,7 @@ func ifbind(who string, ctl Controller) func(string, string, syscall.RawConn) er
 		log.VV("control: netbinder: %s: %s(%s); err? %v", who, network, addr, err)
 		return c.Control(func(fd uintptr) {
 			sock := int(fd)
-			if onlyProtectWildcardAddrs && !maybeGlobalUnicast(addr, true) {
+			if !maybeGlobalUnicast(addr, true) {
 				ctl.Protect(who, sock)
 				return
 			}
@@ -113,7 +106,7 @@ func ipbind(p Protector) func(string, string, syscall.RawConn) error {
 		log.VV("control: ipbinder: %s(%s/%w), bindto(%s); err? %v",
 			network, addr, origaddr, ipaddr, perr)
 
-		if onlyProtectWildcardAddrs && !maybeGlobalUnicast(addr, true) {
+		if !maybeGlobalUnicast(addr, true) {
 			// todo: protect fd?
 			return nil
 		}
@@ -188,7 +181,7 @@ func MakeNsRDial(who string, ctx context.Context, c Controller) *RDial {
 }
 
 // Creates a RDial that can bind to any active interface, with additional control fns.
-func MakeNsRDialExt(who string, ctx context.Context, ctl Controller, ext ...ControlFn) *RDial {
+func MakeNsRDialExt(who string, ctx context.Context, ctl Controller, ext []ControlFn) *RDial {
 	dialer := MakeNsDialer(who, ctl)
 	dialer.Control = func(network, address string, c syscall.RawConn) error {
 		for _, fn := range ext {

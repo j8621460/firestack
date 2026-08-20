@@ -23,7 +23,6 @@ import (
 	"github.com/celzero/firestack/intra/ipn"
 	"github.com/celzero/firestack/intra/log"
 	"github.com/celzero/firestack/intra/protect"
-	"github.com/celzero/firestack/intra/protect/ipmap"
 	"github.com/celzero/firestack/intra/settings"
 	"github.com/celzero/firestack/intra/xdns"
 	"github.com/miekg/dns"
@@ -34,7 +33,7 @@ const (
 	// hostname to ip cache (in ipmap.go via dnsx.RegisterAddrs)
 	bootid = dnsx.Bootstrap
 	// protected hostnames are only used by dnsx.DNS53 transport.
-	protectedHostname = protect.Selfhost // or protect.Systemhost
+	protectedHostname = protect.UidSelf // or protect.UidSystem
 	// special hostname is used only by dnsx.Goos transport.
 	builtinHostname = protect.Localhost
 )
@@ -53,21 +52,20 @@ var (
 // DefaultDNS is the resolver used by all dialers.
 type DefaultDNS interface {
 	x.DNSTransport
-	kickstart(px ipn.ProxyProvider, m ipmap.IPMapper) error
+	kickstart(px ipn.ProxyProvider) error
 	reinit(typ, ipOrUrl, ips string) error
 }
 
 type bootstrap struct {
-	ctx context.Context
+	ctx     context.Context
+	proxies ipn.ProxyProvider // never nil if underlying transport is set
 
-	mu       sync.RWMutex      // protects following fields:
-	proxies  ipn.ProxyProvider // never nil if underlying transport is set
-	mapper   ipmap.IPMapper    // resolver for internal queries; set via kickstart
-	tr       dnsx.Transport    // the underlying transport
-	typ      string            // DOH or DNS53
-	ipports  string            // never empty for DNS53
-	url      string            // never empty for DOH
-	hostname string            // never empty
+	mu       sync.RWMutex   // protects following fields:
+	tr       dnsx.Transport // the underlying transport
+	typ      string         // DOH or DNS53
+	ipports  string         // never empty for DNS53
+	url      string         // never empty for DOH
+	hostname string         // never empty
 }
 
 var _ DefaultDNS = (*bootstrap)(nil)
@@ -76,11 +74,11 @@ var _ dnsx.Transport = (*bootstrap)(nil)
 // NewDefaultDNS creates a new DefaultDNS resolver of type typ. For typ DOH,
 // url scheme is http or https; for typ DNS53, url is ipport or csv(ipport).
 // ips is a csv of ipports for typ DOH, and nil for typ DNS53.
-func NewDefaultDNS(typ, url, ips string) (DefaultDNS, error) {
+func NewDefaultDNS(typ, url, ips *x.Gostr) (DefaultDNS, error) {
 	b := new(bootstrap)
 	b.ctx = context.TODO()
 
-	if err := b.reinit(typ, url, ips); err != nil {
+	if err := b.reinit(typ.V(), url.V(), ips.V()); err != nil {
 		return nil, err
 	}
 
@@ -110,15 +108,13 @@ func NewBuiltinDefaultDNS() (DefaultDNS, error) {
 func (b *bootstrap) newDefaultDohTransportLocked() (dnsx.Transport, error) {
 	ips := strings.Split(b.ipports, ",")
 	if len(b.url) > 0 && len(ips) > 0 {
-		// the resolver is wired in via kickstart (b.mapper), never nil
-		return doh.NewTransport(b.ctx, bootid, b.url, ips, b.proxies, b.mapper)
+		return doh.NewTransport(b.ctx, bootid, b.url, ips, b.proxies)
 	}
 	return nil, errCannotStart
 }
 
 func (b *bootstrap) newDefaultTransportLocked() (dnsx.Transport, error) {
 	if ipcsv := b.ipports; len(ipcsv) > 0 {
-		// b.hostname may be protectedHostname or builtinHostname
 		return dns53.NewTransportFromHostname(b.ctx, bootid, b.hostname, ipcsv, b.proxies)
 	}
 	return nil, errCannotStart
@@ -204,23 +200,22 @@ func (b *bootstrap) reinit(trtype, ippOrUrl, ipcsv string) error {
 }
 
 func (b *bootstrap) recreateLocked() error {
-	return b.kickstartLocked(b.proxies, b.mapper) // restart with new proxies
+	return b.kickstartLocked(b.proxies) // restart with new proxies
 }
 
-func (b *bootstrap) kickstart(px ipn.ProxyProvider, m ipmap.IPMapper) error {
+func (b *bootstrap) kickstart(px ipn.ProxyProvider) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	return b.kickstartLocked(px, m)
+	return b.kickstartLocked(px)
 }
 
-func (b *bootstrap) kickstartLocked(px ipn.ProxyProvider, m ipmap.IPMapper) error {
+func (b *bootstrap) kickstartLocked(px ipn.ProxyProvider) error {
 	if px == nil {
 		return errCannotStart
 	}
 
 	b.proxies = px
-	b.mapper = m
 	useGoos := b.hostname == builtinHostname
 
 	var tr dnsx.Transport
@@ -260,19 +255,19 @@ func (b *bootstrap) kickstartLocked(px ipn.ProxyProvider, m ipmap.IPMapper) erro
 	return nil
 }
 
-func (*bootstrap) ID() string {
+func (*bootstrap) ID() *x.Gostr {
 	// never assume underlying transport's identity
-	return dnsx.Default
+	return x.StrOf(dnsx.Default)
 }
 
-func (b *bootstrap) Type() string {
-	return b.typ // DOH or DNS53
+func (b *bootstrap) Type() *x.Gostr {
+	return x.StrOf(b.typ) // DOH or DNS53
 }
 
 func (b *bootstrap) Query(network string, q *dns.Msg, smm *x.DNSSummary) (*dns.Msg, error) {
 	smm.ID = dnsx.Default
 	smm.Type = b.typ
-	smm.UID = protect.MyUid
+	smm.UID = protect.UidSelf
 	if tr := b.tr; tr != nil {
 		if settings.Debug {
 			log.V("dns: default: %s query? %t", network, q != nil)
@@ -280,7 +275,6 @@ func (b *bootstrap) Query(network string, q *dns.Msg, smm *x.DNSSummary) (*dns.M
 		return dnsx.Req(tr, network, q, smm)
 	}
 	smm.Status = dnsx.TransportError // InternalError?
-	smm.Msg = strings.Join([]string{smm.Msg, errDefaultTransportNotReady.Error()}, ";")
 	return nil, errDefaultTransportNotReady
 }
 
@@ -291,29 +285,15 @@ func (b *bootstrap) P50() int64 {
 	return 0
 }
 
-func (b *bootstrap) GetAddr() string {
+func (b *bootstrap) GetAddr() *x.Gostr {
 	if tr := b.tr; tr != nil {
 		return tr.GetAddr()
 	}
-	return dnsx.NoDNS
-}
-
-func (b *bootstrap) Measure(mid string, n, seconds int32) *x.DNSMeasurement {
-	return dnsx.Perf(b, mid, n, seconds)
+	return x.StrOf(dnsx.NoDNS)
 }
 
 func (b *bootstrap) GetRelay() x.Proxy {
-	if tr := b.tr; tr != nil {
-		return tr.GetRelay() // usually nil
-	}
 	return nil
-}
-
-func (b *bootstrap) Relaying() bool {
-	if tr := b.tr; tr != nil {
-		return tr.Relaying() // usually false
-	}
-	return false
 }
 
 func (b *bootstrap) IPPorts() []netip.AddrPort {
@@ -323,7 +303,7 @@ func (b *bootstrap) IPPorts() []netip.AddrPort {
 	return dnsx.NoIPPort
 }
 
-func (b *bootstrap) Status() int32 {
+func (b *bootstrap) Status() int {
 	if tr := b.tr; tr != nil {
 		return tr.Status()
 	}
@@ -342,7 +322,7 @@ func typstr(tr dnsx.Transport) string {
 	if tr == nil {
 		return "<notype>"
 	}
-	return tr.Type()
+	return tr.Type().V()
 }
 
 func ippstr(tr dnsx.Transport) string {

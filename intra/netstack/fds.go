@@ -72,16 +72,12 @@ type fds struct {
 	stopFd stopFd
 	tunFd  int
 
-	since atomic.Int64 // when fd was created
-	death atomic.Int64 // age in millis
-
-	read      atomic.Uint64 // number of bytes read
-	written   atomic.Uint64 // number of bytes written
-	lastRead  atomic.Int64  // last read time in millis
-	lastWrite atomic.Int64  // last write time in millis
-
-	dispatchStart atomic.Int64 // dispatcher start time in millis
-	dispatchEnd   atomic.Int64 // dispatcher end time in millis
+	read      atomic.Int64 // number of bytes read
+	written   atomic.Int64 // number of bytes written
+	since     atomic.Int64 // when fd was created
+	death     atomic.Int64 // age in millis
+	lastRead  atomic.Int64 // last read time in millis
+	lastWrite atomic.Int64 // last write time in millis
 
 	closed atomic.Bool
 	once   sync.Once // ensures that stop() is called only once
@@ -148,22 +144,12 @@ func (f *fds) stop() {
 	}
 }
 
-func (f *fds) String() (s string) {
-	if f == nil {
-		return "<nil-fd>"
-	}
-	if f.tunFd == invalidfd {
-		return "<invalid-fd>"
-	}
-	if f.closed.Load() {
-		s = "<closed-fd> "
-	}
-	return s + strconv.Itoa(f.tunFd)
+func (f *fds) String() string {
+	return strconv.Itoa(f.tunFd)
 }
 
 func clos(fd int) {
-	// Only close real tun fds (>2); 0/1/2 are stdin/out/err and invalidfd (-1) is sentinel.
-	if fd > 2 {
+	if fd > 0 || fd != invalidfd {
 		_ = syscall.Close(fd)
 	}
 }

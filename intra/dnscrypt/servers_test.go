@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/netip"
 	"testing"
-	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/dialers"
@@ -38,10 +37,9 @@ type fakeObs struct {
 	x.ProxyListener
 }
 
-func (*fakeObs) OnProxyAdded(string, string)   {}
-func (*fakeObs) OnProxyRemoved(string, string) {}
-func (*fakeObs) OnProxyUpdated(string, string) {}
-func (*fakeObs) OnProxiesStopped()             {}
+func (*fakeObs) OnProxyAdded(*x.Gostr)   {}
+func (*fakeObs) OnProxyRemoved(*x.Gostr) {}
+func (*fakeObs) OnProxiesStopped()       {}
 
 /*
 type fakeBdg struct {
@@ -51,7 +49,7 @@ type fakeBdg struct {
 
 var (
 	baseNsOpts = &dnsx.NsOpts{PID: ipn.Base, IPCSV: "", TIDCSV: ""}
-	baseMark   = &intra.Mark{PID: ipn.Base, CID: "testcid", UID: protect.MyUid}
+	baseMark   = &intra.Mark{PID: ipn.Base, CID: "testcid", UID: protect.UidSelf}
 	baseTab    = &rnet.Tab{CID: "testcid", Block: false}
 )
 
@@ -69,11 +67,27 @@ type fakeResolver struct {
 	*net.Resolver
 }
 
-func (r fakeResolver) Lookup(*dns.Msg, string, ...string) (*dns.Msg, error) {
+func (r fakeResolver) LocalLookup([]byte) ([]byte, error) {
 	return nil, errors.New("not implemented")
 }
 
-func (r fakeResolver) LookupNetIP(_ context.Context, _, _, _ string, _ ...string) ([]netip.Addr, error) {
+func (r fakeResolver) Lookup([]byte, string, ...string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupFor([]byte, string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupNetIP(_ context.Context, _, _ string) ([]netip.Addr, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupNetIPFor(_ context.Context, _, _, _ string) ([]netip.Addr, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r fakeResolver) LookupNetIPOn(_ context.Context, _, _ string, _ ...string) ([]netip.Addr, error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -117,7 +131,7 @@ func TestOne(t *testing.T) {
 		t.Fatal(errors.Join(dnsx.ErrAddFailed, err))
 	}
 	q := aquery("google.com")
-	smm := &x.DNSSummary{Start: time.Now().UnixMilli()}
+	smm := &x.DNSSummary{}
 	netw := xdns.NetAndProxyID("udp", ipn.Base)
 	// FIXME: querying always fails with EOF
 	ans, err := tr.Query(netw, q, smm)

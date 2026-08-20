@@ -18,7 +18,6 @@ package doh
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -416,8 +415,7 @@ func TestDoh(t *testing.T) {
 	tr, _ := NewTransport("test0", "https://8.8.8.8/dns-query", nil, pxr, ctl)
 	dtr, _ := NewTransport(x.Default, "https://1.1.1.1/dns-query", nil, pxr, ctl)
 
-	natpt := x64.NewNatPt2(context.Background())
-	natpt.Kickstart(netr)
+	natpt := x64.NewNatPt(tm)
 	resolv := dnsx.NewResolver("10.111.222.3", tm, dtr, bdg, natpt)
 	resolv.Add(tr)
 	r4, err := resolv.Forward(b4)
