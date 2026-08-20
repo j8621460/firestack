@@ -59,14 +59,28 @@ jobs:
           go-version: '>=1.26'
           check-latest: true
 
-      - name: 🤖 Install NDK ${{ env.NDKVER }}
+      # The runner already ships an SDK, but sdkmanager's location moves between
+      # images. This action normalises it and puts sdkmanager on PATH.
+      - name: 🤖 Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      - name: 🤖 Install SDK ${{ env.SDKVER }} + NDK ${{ env.NDKVER }}
         run: |
-          set -eux
-          yes | "$ANDROID_HOME"/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null
-          "$ANDROID_HOME"/cmdline-tools/latest/bin/sdkmanager \
-            "platforms;android-${SDKVER}" \
-            "build-tools;${SDKVER}.0.0" \
-            "ndk;${NDKVER}"
+          set -eu
+          sdkmanager --install "platforms;android-${SDKVER}" "build-tools;${SDKVER}.0.0"
+
+          # Pin the NDK if that exact version is still published. If it is not,
+          # fall back to the NDK bundled with the runner rather than failing the
+          # build: make-aar reads ANDROID_NDK_LATEST_HOME when NDKVER is unset.
+          if sdkmanager --install "ndk;${NDKVER}"; then
+            echo "NDKVER=${NDKVER}" >> "$GITHUB_ENV"
+            echo "::notice::using pinned NDK ${NDKVER}"
+          else
+            echo "NDKVER=0" >> "$GITHUB_ENV"
+            echo "::warning::NDK ${NDKVER} unavailable; falling back to ${ANDROID_NDK_LATEST_HOME:-runner default}"
+          fi
         shell: bash
 
       - name: 🏗️ Build aar
