@@ -181,7 +181,11 @@ func verifiedKeysFor(ctx context.Context, r Resolver, zone string) ([]*dns.DNSKE
 			// answer is not proof that the delegation is unsigned.
 			return nil, ResultIndeterminate, fmt.Errorf("DS(%s): missing signed delegation", child)
 		}
-		if res, err := verifyRRSIGSet(ds, dsSigs, trustedKeys); err != nil || res != ResultSecure {
+		dsRRset := make([]dns.RR, len(ds))
+		for i, record := range ds {
+			dsRRset[i] = record
+		}
+		if res, err := verifyRRSIGSet(dsRRset, dsSigs, trustedKeys); err != nil || res != ResultSecure {
 			if err == nil {
 				err = errors.New("no valid RRSIG over DS RRset")
 			}
