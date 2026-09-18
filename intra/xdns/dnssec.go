@@ -297,7 +297,7 @@ func queryDNSKEY(ctx context.Context, r Resolver, zone string) ([]*dns.DNSKEY, [
 	return keys, sigs, nil
 }
 
-func queryDS(ctx context.Context, r Resolver, zone string) ([]dns.RR, []*dns.RRSIG, error) {
+func queryDS(ctx context.Context, r Resolver, zone string) ([]*dns.DS, []*dns.RRSIG, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(zone, dns.TypeDS)
 	msg.SetEdns0(4096, true)
@@ -305,7 +305,7 @@ func queryDS(ctx context.Context, r Resolver, zone string) ([]dns.RR, []*dns.RRS
 	if err != nil {
 		return nil, nil, err
 	}
-	var ds []dns.RR
+	var ds []*dns.DS
 	var sigs []*dns.RRSIG
 	for _, rr := range ans.Answer {
 		switch v := rr.(type) {
